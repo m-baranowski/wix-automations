@@ -72,11 +72,22 @@
  *    FAKTURY_PREVIEW_SUMY (brutto, rabaty, netto, już rozliczone,
  *    do nowych faktur, do sprawdzenia, anulowane, zerowe),
  *    FAKTURY_PREVIEW_KONTROLE, FAKTURY_PREVIEW_doRecznejDecyzji.
- *    Wymagane: kontroleOk = true, bledyGlobalne = [].
+ *    Wymagane: kontroleOk = true (arytmetykaOk i kompletne),
+ *    bledyGlobalne = []. Braki kompletności (sumy.braki: nieodczytane
+ *    lub bez kwoty zamówienia, zdublowane orderId, cykle bez zamówień,
+ *    wpisy dziennika bez kontaktu) trzeba rozstrzygnąć albo świadomie
+ *    wyłączyć, podając DOKŁADNIE te ID w akceptujNiekompletne.
  * 2. TRYB 'PREPARE' — zapis PREPARED + przypisania. Bez faktur.
  *    Log FAKTURY_PREPARE podaje doZatwierdzenia: liczba i suma.
  * 3. TRYB 'APPROVE' — wpisz w OPCJE.APPROVE oczekiwanaLiczba
  *    i oczekiwanaSuma z PREVIEW/PREPARE; niezgodność = odmowa.
+ *    AUDYT: najpierw sprawdź w panelu Faktury, że zatwierdzani klienci
+ *    nie mają już faktur za listopad wystawionych poza dziennikiem
+ *    (ręcznie, starym skryptem) — API Wix tego nie wykrywa. Potem
+ *    audytFaktur = { sprawdzono: true, kto, zakres }. Audyt zapisuje
+ *    się w każdej operacji z miesiącem, kontaktem, orderIds
+ *    i fingerprintem; RUN bez aktualnego audytu = NEEDS_REVIEW /
+ *    BRAK_AUDYTU, bez faktury.
  * 4. TRYB 'RUN', OPCJE.RUN = { maxOperacji: 1, etap: 'UTWORZ',
  *    operationIds: ['<id>'] } — faktura próbna (najlepiej klient
  *    z rabatem), obejrzyj w panelu Faktury. Jeżeli Wix odrzuci ujemną
@@ -115,8 +126,13 @@
  *      wysłana → 'WYSLANA';  nie dotarła → 'WYSLIJ_PONOWNIE', potwierdzam
  *  INVOICE_MISMATCH / INVOICE_STATUS: nie wysyłaj; popraw ręcznie →
  *      'ZAMKNIJ_RECZNIE' + uwagi
- *  ZMIANA_DANYCH / KONTAKT / KWOTA (przed createInvoice): 'ANULUJ'
- *      i ponowny PREPARE.
+ *  ZMIANA_DANYCH / KONTAKT / KWOTA / BRAK_AUDYTU (przed createInvoice):
+ *      'ANULUJ' i ponowne PREPARE + APPROVE z audytem.
+ *  Kontrola faktury (przed wysyłką i przy FAKTURA_ISTNIEJE) porównuje
+ *  kontakt, PLN, metadata.sourceRefId, KAŻDĄ pozycję (nazwa, ilość,
+ *  cena), rabat faktury i sumę z planem w dzienniku. Brak sourceRefId
+ *  (faktura ręczna) dopuszczalny tylko przy FAKTURA_ISTNIEJE
+ *  z potwierdzam: true i pełną zgodnością pozycji.
  * Nie usuwaj ręcznie wierszy CREATING ani przypisań. Nie wysyłaj
  * ręcznie z panelu faktur CREATED (ryzyko podwójnego e-maila i SMS).
  *
@@ -142,8 +158,11 @@
  * DECYZJE RĘCZNE: PAID bez faktury, częściowe płatności, zwroty,
  * niezgodne kwoty/rabaty, inny kontakt/klucz, dodatkowe zamówienie
  * umowy, cykl ≠ DONE lub bez zamówienia, kontakt scalony/bez e-maila,
- * wszystkie NEEDS_REVIEW, faktury listopadowe wystawione ręcznie poza
- * skryptem (API ich nie wykrywa — potwierdź przed PREPARE).
+ * wszystkie NEEDS_REVIEW, wpisy dziennika za listopad spoza modelu v2,
+ * braki kompletności, faktury listopadowe wystawione ręcznie poza
+ * skryptem (API ich nie wykrywa — audyt w APPROVE).
+ * Brak wymaganej kwoty w zamówieniu (cena, subtotal, total) nie jest
+ * traktowany jak 0 — zamówienie ma kwotę NIEZNANA i trafia do kontroli.
  */
 import wixData from 'wix-data';
 import { invoices } from 'wix-billing-backend';
@@ -165,10 +184,22 @@ const OPCJE = {
   PREVIEW: {},
 
   // Puste contactIds = wszyscy klienci z PREVIEW.
-  PREPARE: { contactIds: [] },
+  // akceptujNiekompletne: tylko gdy PREVIEW pokazał braki (sumy.braki)
+  // i świadomie je wyłączasz — wpisz DOKŁADNIE te ID, np.
+  // { orderIds: ['...'], umowaIds: ['...'], wpisyDziennika: [] }.
+  PREPARE: { contactIds: [], akceptujNiekompletne: null },
 
   // Liczba i suma z logu FAKTURY_PREPARE (doZatwierdzenia).
-  APPROVE: { wszystkie: true, oczekiwanaLiczba: null, oczekiwanaSuma: '' },
+  // audytFaktur: potwierdzenie, że w panelu Faktury nie ma faktur za
+  // listopad dla zatwierdzanych klientów wystawionych poza dziennikiem
+  // (API Wix tego nie wykrywa). Zapisywane trwale w każdej operacji.
+  APPROVE: {
+    wszystkie: true,
+    oczekiwanaLiczba: null,
+    oczekiwanaSuma: '',
+    audytFaktur: { sprawdzono: false, kto: '', zakres: '' },
+    akceptujNiekompletne: null
+  },
 
   // etap: 'UTWORZ' | 'WYSLIJ' | 'OBA'; puste operationIds = kolejne z dziennika.
   RUN: { maxOperacji: 1, etap: 'UTWORZ', operationIds: [] },
@@ -312,12 +343,36 @@ function canon(x) {
 }
 
 // Kwota Wix (string "160.00", liczba albo obiekt Price) -> grosze.
-// Odrzuca wartości z więcej niż 2 miejscami po przecinku.
+// Pole OPCJONALNE: brak wartości = 0 (np. brak rabatu, podatku).
+// Do kwot, które muszą istnieć (cena, subtotal, total), służy
+// groszeWymagane() — brak nie może zamienić się w 0 (przegląd R3).
 function grosze(value) {
   const raw =
     value && typeof value === 'object' ? value.amount : value;
 
   if (raw === undefined || raw === null || raw === '') return 0;
+
+  return parsujGrosze(raw);
+}
+
+function groszeWymagane(value, nazwa) {
+  const raw =
+    value && typeof value === 'object' ? value.amount : value;
+
+  if (raw === undefined || raw === null || raw === '') {
+    throw new Error(`Brak wymaganej kwoty: ${nazwa}.`);
+  }
+
+  return parsujGrosze(raw);
+}
+
+function parsujGrosze(raw) {
+  if (
+    typeof raw !== 'number' &&
+    !(typeof raw === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(raw))
+  ) {
+    throw new Error(`Nieprawidłowa kwota: ${JSON.stringify(raw)}`);
+  }
 
   const n = Number(raw);
 
@@ -326,6 +381,10 @@ function grosze(value) {
   }
 
   const c = Math.round(n * 100);
+
+  if (!Number.isSafeInteger(c)) {
+    throw new Error(`Kwota poza zakresem: ${raw}`);
+  }
 
   if (Math.abs(n * 100 - c) > 1e-6) {
     throw new Error(`Kwota z więcej niż 2 miejscami: ${raw}`);
@@ -400,13 +459,19 @@ function dataWizyty(line) {
 /**
  * Normalizuje zamówienie eCommerce (kształt SDK @wix/ecom).
  * Zwraca kwoty w groszach i listę problemów uzgodnienia.
+ * Brak wymaganej kwoty (cena pozycji, subtotal, total) = wyjątek:
+ * zamówienie zostaje z NIEZNANĄ kwotą i trafia do ręcznej kontroli.
  */
 function normalizujZamowienie(raw) {
   const problemy = [];
   const p = raw.priceSummary || {};
 
-  const linie = (raw.lineItems || []).map(li => {
-    const cena = grosze(li.price);
+  if (!Array.isArray(raw.lineItems) || !raw.lineItems.length) {
+    throw new Error('Zamówienie bez pozycji.');
+  }
+
+  const linie = raw.lineItems.map(li => {
+    const cena = groszeWymagane(li.price, `cena pozycji ${idOf(li)}`);
     const ilosc = Number(li.quantity);
 
     if (!Number.isInteger(ilosc) || ilosc <= 0) {
@@ -462,12 +527,12 @@ function normalizujZamowienie(raw) {
   }
 
   const brutto = suma(linie, x => x.brutto);
-  const subtotal = grosze(p.subtotal);
+  const subtotal = groszeWymagane(p.subtotal, 'priceSummary.subtotal');
   const rabat = grosze(p.discount);
   const podatek = grosze(p.tax);
   const wysylka = grosze(p.shipping);
   const oplaty = grosze(p.totalAdditionalFees);
-  const razem = grosze(p.total);
+  const razem = groszeWymagane(p.total, 'priceSummary.total');
   const sumaRabatow = suma(rabaty, x => x.kwota);
   const sumaRabatowPozycji = suma(linie, x => x.rabatPozycji);
 
@@ -715,6 +780,19 @@ function klasyfikujBazowo(w, cfg) {
 
   if (powody.length) {
     return { kategoria: K.DO_SPRAWDZENIA, powody };
+  }
+
+  // Wpis listopada w FakturyMiesieczne spoza modelu v2 (np. skrypt
+  // październikowy z innym MIESIAC) może oznaczać wystawioną fakturę,
+  // której Order Invoices nie pokaże (przegląd R1).
+  if (w.obceWpisy?.length) {
+    return {
+      kategoria: K.DO_SPRAWDZENIA,
+      powody: [
+        'W dzienniku jest wpis tego klienta za ten miesiąc spoza modelu v2 ' +
+        `(${w.obceWpisy.join(', ')}) — sprawdź, czy faktura nie istnieje.`
+      ]
+    };
   }
 
   return { kategoria: K.DO_FAKTURY, powody: [] };
@@ -1019,11 +1097,25 @@ function polaFaktury(plan, kontakt, cfg, teraz) {
   return pola;
 }
 
-// Kontrola faktury odczytanej przez getInvoice() przed wysyłką.
-function sprawdzFakture(faktura, op) {
+// Kontrola faktury odczytanej przez getInvoice() przed wysyłką
+// i przy przypinaniu faktury (RESOLVE FAKTURA_ISTNIEJE).
+// Porównuje z planem zapisanym w dzienniku: kontakt, walutę,
+// powiązanie z operacją, każdą pozycję (nazwa, ilość, cena),
+// rabat faktury i sumę (przegląd R2). Brak pola = problem,
+// chyba że wyjątek jest jawnie podany w `opcje`.
+function sprawdzFakture(faktura, op, opcje = {}) {
   const problemy = [];
 
   if (!faktura) return ['Nie odczytano faktury.'];
+
+  const kwota = (v, nazwa) => {
+    try {
+      return groszeWymagane(v, nazwa);
+    } catch (e) {
+      problemy.push(e.message);
+      return null;
+    }
+  };
 
   if (faktura.id?.id !== op.invoiceId) {
     problemy.push('Odczytana faktura ma inne ID.');
@@ -1033,34 +1125,73 @@ function sprawdzFakture(faktura, op) {
     problemy.push('Faktura wystawiona na inny kontakt.');
   }
 
-  if (faktura.currency && faktura.currency !== 'PLN') {
-    problemy.push(`Waluta faktury ${faktura.currency}.`);
+  if (faktura.currency !== 'PLN') {
+    problemy.push(`Waluta faktury: ${faktura.currency || 'brak'}.`);
   }
 
   const ref = faktura.metadata?.sourceRefId;
 
-  if (ref && ref !== op._id) {
-    problemy.push(`Faktura należy do innej operacji (${ref}).`);
+  if (ref !== op._id && !(opcje.bezRef && !ref)) {
+    problemy.push(
+      ref
+        ? `Faktura należy do innej operacji (${ref}).`
+        : 'Faktura bez metadata.sourceRefId.'
+    );
   }
 
-  try {
-    const total = grosze(faktura.totals?.total);
+  const total = kwota(faktura.totals?.total, 'totals.total faktury');
 
-    if (total !== op.kwotaGrosze) {
-      problemy.push(
-        `Suma faktury ${zl(total)} ≠ oczekiwana ${zl(op.kwotaGrosze)}.`
-      );
-    }
-  } catch (e) {
-    problemy.push(`Nieczytelna suma faktury: ${e.message}`);
+  if (total !== null && total !== op.kwotaGrosze) {
+    problemy.push(
+      `Suma faktury ${zl(total)} ≠ oczekiwana ${zl(op.kwotaGrosze)}.`
+    );
   }
 
-  if (
-    Array.isArray(faktura.lineItems) &&
-    Array.isArray(op.pozycje) &&
-    faktura.lineItems.length !== op.pozycje.length
-  ) {
+  const plan = Array.isArray(op.pozycje) ? op.pozycje : null;
+  const linie = Array.isArray(faktura.lineItems) ? faktura.lineItems : null;
+
+  if (!plan || !plan.length) {
+    problemy.push('Operacja nie ma zapisanych pozycji planu.');
+  } else if (!linie) {
+    problemy.push('Faktura bez listy pozycji.');
+  } else if (linie.length !== plan.length) {
     problemy.push('Liczba pozycji faktury ≠ liczba pozycji planu.');
+  } else {
+    plan.forEach((p, i) => {
+      const l = linie[i];
+      const nr = i + 1;
+
+      if (norm(l?.name) !== norm(p.nazwa)) {
+        problemy.push(`Pozycja ${nr}: nazwa „${l?.name}” ≠ „${p.nazwa}”.`);
+      }
+
+      if (Number(l?.quantity) !== p.ilosc) {
+        problemy.push(`Pozycja ${nr}: ilość ${l?.quantity} ≠ ${p.ilosc}.`);
+      }
+
+      const cena = kwota(l?.price, `cena pozycji ${nr}`);
+
+      if (cena !== null && cena !== p.cena) {
+        problemy.push(`Pozycja ${nr}: cena ${zl(cena)} ≠ ${zl(p.cena)}.`);
+      }
+    });
+  }
+
+  const rabatPlanu = op.rabatFaktury || 0;
+  const d = faktura.discount;
+  const rabatFaktury =
+    d && d.value !== undefined && d.value !== null
+      ? kwota(d.value, 'rabat faktury')
+      : 0;
+
+  if (rabatFaktury !== null && rabatFaktury !== rabatPlanu) {
+    problemy.push(
+      `Rabat faktury ${zl(rabatFaktury)} ≠ oczekiwany ${zl(rabatPlanu)}.`
+    );
+  }
+
+  if (rabatFaktury && String(d?.type).toLowerCase() !== 'fixed') {
+    problemy.push(`Rabat faktury typu ${d?.type}, oczekiwano Fixed.`);
   }
 
   return problemy;
@@ -1143,6 +1274,9 @@ function analizuj(stan, cfg) {
     const przypisanie = stan.przypisania.get(row.orderId) || null;
 
     const w = {
+      obceWpisy: (stan.obceWpisy || [])
+        .filter(x => x.klientContactId === row.klientContactId)
+        .map(x => x._id),
       row,
       umowa,
       klient,
@@ -1249,7 +1383,22 @@ function analizuj(stan, cfg) {
     );
   }
 
-  const sumy = policzSumy(zamowienia, plany, weryfikacjaPlanowanych);
+  for (const x of stan.obceWpisy || []) {
+    if (!x.klientContactId) {
+      ostrzezenia.push(
+        `Wpis dziennika ${x._id} za ${cfg.miesiac} spoza modelu v2 bez ` +
+        'klientContactId — nie da się go przypisać do klienta.'
+      );
+    }
+  }
+
+  const sumy = policzSumy(
+    zamowienia,
+    plany,
+    weryfikacjaPlanowanych,
+    cykleBezZamowien,
+    (stan.obceWpisy || []).filter(x => !x.klientContactId).map(x => x._id)
+  );
 
   return {
     miesiac: cfg.miesiac,
@@ -1314,33 +1463,111 @@ function zweryfikujOperacje(op, zamowienia, cfg) {
     }
   }
 
+  // Operacja zatwierdzona musi mieć aktualny audyt administratora.
+  const audyt = op.status === S.APPROVED ? problemyAudytu(op, cfg) : [];
+
   return {
     operationId: op._id,
     status: op.status,
     klient: op.klientNazwa,
     kwota: zl(op.kwotaGrosze || 0),
     kwotaGrosze: op.kwotaGrosze || 0,
-    ok: !problemy.length,
-    problemy,
+    ok: !problemy.length && !audyt.length,
+    brakAudytu: audyt.length > 0,
+    problemy: [...problemy, ...audyt],
     plan
   };
 }
 
-function policzSumy(zamowienia, plany, planowane = []) {
-  const kwota = w =>
-    w.zamowienie
-      ? w.zamowienie.razem
-      : grosze(w.row.kwota || 0);
+/**
+ * Audyt administratora (przegląd R1): API nie pozwala wykryć faktur
+ * wystawionych poza dziennikiem (ręcznie w panelu, starym skryptem).
+ * APPROVE zapisuje w każdej operacji deklarację, że historia faktur
+ * klienta za miesiąc została sprawdzona — powiązaną z miesiącem,
+ * kontaktem, orderIds i fingerprintem. Brak lub nieaktualny audyt
+ * = brak faktury.
+ */
+function problemyAudytu(op, cfg) {
+  const a = op.audytFaktur;
 
-  const wKat = k => zamowienia.filter(w => w.kategoria === k);
-  const s = list => suma(list, kwota);
-  const znane = zamowienia.filter(w => w.zamowienie);
+  if (!a || a.sprawdzono !== true || !a.kto) {
+    return ['Brak audytu faktur administratora (APPROVE.audytFaktur).'];
+  }
+
+  const p = [];
+
+  if (a.miesiac !== cfg.miesiac) p.push('Audyt dotyczy innego miesiąca.');
+  if (a.contactId !== op.klientContactId) p.push('Audyt dotyczy innego kontaktu.');
+  if (a.fingerprint !== op.fingerprint) p.push('Audyt dotyczy innej wersji zamówień.');
+
+  if (
+    !Array.isArray(a.orderIds) ||
+    [...a.orderIds].sort().join(',') !== [...op.orderIds].sort().join(',')
+  ) {
+    p.push('Audyt dotyczy innych zamówień.');
+  }
+
+  return p.map(x => `Nieaktualny audyt faktur: ${x}`);
+}
+
+// Kwota zamówienia do sum: odczytana, szacunek z cyklu albo null (nieznana).
+function kwotaDoSum(w) {
+  if (w.zamowienie) return w.zamowienie.razem;
+
+  const k = w.row.kwota;
+
+  if (typeof k === 'number' && Number.isFinite(k) && k > 0) {
+    try {
+      return groszeWymagane(k, 'kwota cyklu');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Sumy kontrolne (przegląd R4). Dwie niezależne kontrole:
+ *  - arytmetyka: należności nie znikają między kategoriami,
+ *  - kompletność: każde zamówienie odczytane, z kwotą, policzone raz,
+ *    każdy cykl ma zamówienie, każdy wpis dziennika przypisany.
+ * kontroleOk wymaga obu. Braki można wyłączyć tylko jawnie
+ * (OPCJE.*.akceptujNiekompletne), wskazując konkretne ID.
+ */
+function policzSumy(
+  zamowienia,
+  plany,
+  planowane = [],
+  cykleBezZamowien = [],
+  nieprzypisaneWpisy = []
+) {
+  // Każde zamówienie liczone raz — duplikaty orderId tylko raportujemy.
+  const widziane = new Set();
+  const zdublowane = new Set();
+  const unikalne = [];
+
+  for (const w of zamowienia) {
+    if (widziane.has(w.row.orderId)) {
+      zdublowane.add(w.row.orderId);
+      continue;
+    }
+    widziane.add(w.row.orderId);
+    unikalne.push(w);
+  }
+
+  const nieodczytane = unikalne.filter(w => !w.zamowienie);
+  const bezKwoty = unikalne.filter(w => kwotaDoSum(w) === null);
+
+  const wKat = k => unikalne.filter(w => w.kategoria === k);
+  const s = list => suma(list, w => kwotaDoSum(w) ?? 0);
+  const znane = unikalne.filter(w => w.zamowienie);
 
   const r = {
-    liczbaZamowien: zamowienia.length,
+    liczbaZamowien: unikalne.length,
     bruttoGrosze: suma(znane, w => w.zamowienie.brutto),
     rabatyGrosze: suma(znane, w => w.zamowienie.rabat),
-    nettoGrosze: s(zamowienia),
+    nettoGrosze: s(unikalne),
     juzRozliczoneGrosze: s(wKat(K.ROZLICZONE)),
     doNowychFakturGrosze: s(wKat(K.DO_FAKTURY)) + s(wKat(K.W_PRZYGOTOWANIU)),
     nowePlanyGrosze: s(wKat(K.DO_FAKTURY)),
@@ -1348,7 +1575,7 @@ function policzSumy(zamowienia, plany, planowane = []) {
     doSprawdzeniaGrosze: s(wKat(K.DO_SPRAWDZENIA)),
     anulowaneGrosze: s(wKat(K.ANULOWANE)),
     zeroweGrosze: s(wKat(K.ZEROWE)),
-    szacunkoweGrosze: s(zamowienia.filter(w => !w.zamowienie)),
+    szacunkoweGrosze: s(nieodczytane),
     sumaPlanowGrosze: suma(plany, p => p.razem),
     sumaPlanowanychOperacjiGrosze: suma(planowane, p => p.kwotaGrosze),
     liczby: Object.fromEntries(
@@ -1377,7 +1604,33 @@ function policzSumy(zamowienia, plany, planowane = []) {
       suma(znane, w => w.zamowienie.razem)
   };
 
-  r.kontroleOk = Object.values(r.kontrole).every(Boolean);
+  r.arytmetykaOk = Object.values(r.kontrole).every(Boolean);
+
+  // Kompletność źródeł — zgodna arytmetyka nie dowodzi kompletności.
+  r.kompletnosc = {
+    nieodczytaneZamowienia: nieodczytane.map(w => w.row.orderId),
+    bezKwoty: bezKwoty.map(w => w.row.orderId),
+    zdublowaneOrderId: [...zdublowane],
+    cykleBezZamowien: cykleBezZamowien.map(c => c.umowaId),
+    nieprzypisaneWpisyDziennika: nieprzypisaneWpisy
+  };
+
+  r.braki = {
+    orderIds: [...new Set([
+      ...r.kompletnosc.nieodczytaneZamowienia,
+      ...r.kompletnosc.bezKwoty,
+      ...r.kompletnosc.zdublowaneOrderId
+    ])].sort(),
+    umowaIds: [...new Set(r.kompletnosc.cykleBezZamowien)].sort(),
+    wpisyDziennika: [...nieprzypisaneWpisy].sort()
+  };
+
+  r.kompletne =
+    !r.braki.orderIds.length &&
+    !r.braki.umowaIds.length &&
+    !r.braki.wpisyDziennika.length;
+
+  r.kontroleOk = r.arytmetykaOk && r.kompletne;
 
   r.zl = {
     brutto: zl(r.bruttoGrosze),
@@ -1389,11 +1642,34 @@ function policzSumy(zamowienia, plany, planowane = []) {
     anulowane: zl(r.anulowaneGrosze),
     zerowe: zl(r.zeroweGrosze),
     szacunkowe: zl(r.szacunkoweGrosze),
+    nieznanychKwot: bezKwoty.length,
     sumaNowychPlanow: zl(r.sumaPlanowGrosze),
     sumaPlanowanychOperacji: zl(r.sumaPlanowanychOperacjiGrosze)
   };
 
   return r;
+}
+
+/**
+ * Jawna akceptacja braków kompletności: administrator musi wymienić
+ * dokładnie te ID, które PREVIEW pokazał w sumy.braki.
+ * @returns {string|null} opis odmowy albo null
+ */
+function sprawdzAkceptacjeBrakow(braki, akceptacja) {
+  const a = akceptacja || {};
+
+  for (const [klucz, lista] of Object.entries(braki)) {
+    const dane = [...new Set(a[klucz] || [])].sort();
+
+    if (dane.join(',') !== lista.join(',')) {
+      return (
+        `Niekompletne dane (${klucz}: ${lista.join(', ') || 'brak'}). ` +
+        `Rozstrzygnij je albo podaj dokładnie te ID w akceptujNiekompletne.${klucz}.`
+      );
+    }
+  }
+
+  return null;
 }
 
 // Wiersz tabeli PREVIEW dla jednego zamówienia.
@@ -1417,7 +1693,9 @@ function wierszTabeli(w) {
       ? o.rabaty.map(r => `${zl(r.kwota)} (${r.opis})`).join('; ')
       : '',
     rabat: o ? zl(o.rabat) : '',
-    netto: o ? zl(o.razem) : `~${zl(grosze(w.row.kwota || 0))}`,
+    netto: o
+      ? zl(o.razem)
+      : kwotaDoSum(w) === null ? 'NIEZNANA' : `~${zl(kwotaDoSum(w))}`,
     statusZamowienia: o?.status || '',
     platnosc: o?.paymentStatus || '',
     fakturyWix: w.fakturyWix
@@ -1465,6 +1743,15 @@ function createJournal(db, cfg, opts = {}) {
       rodzaj: RODZAJ_FAKTURA
     });
     return new Map(rows.map(r => [r._id, r]));
+  }
+
+  // Wpisy miesiąca spoza modelu v2 (np. format październikowy bez
+  // `rodzaj`) — mogą oznaczać fakturę wystawioną innym skryptem (R1).
+  async function obceWpisy() {
+    const rows = await db.find(LEDGER, { miesiac: cfg.miesiac });
+    return rows.filter(r =>
+      ![RODZAJ_FAKTURA, RODZAJ_ZAMOWIENIE].includes(r.rodzaj)
+    );
   }
 
   async function przypisania() {
@@ -1817,6 +2104,7 @@ function createJournal(db, cfg, opts = {}) {
 
   return {
     operacje,
+    obceWpisy,
     przypisania,
     przypisaniaDla,
     operacjeDla,
@@ -2203,6 +2491,7 @@ function createProcess({ gateway, journal, cfg, now, log }) {
 
     const przypisania = await journal.przypisaniaDla(orderIds);
     const operacje = await journal.operacjeDla(przypisania);
+    const obceWpisy = await journal.obceWpisy();
 
     const bledyGlobalne = [];
 
@@ -2233,6 +2522,7 @@ function createProcess({ gateway, journal, cfg, now, log }) {
       transakcje,
       przypisania,
       operacje,
+      obceWpisy,
       bledyGlobalne
     };
   }
@@ -2297,11 +2587,33 @@ function createProcess({ gateway, journal, cfg, now, log }) {
       miesiac: cfg.miesiac,
       sumy: { ...a.sumy.zl, liczby: a.sumy.liczby },
       kontroleSum: a.sumy.kontrole,
+      arytmetykaOk: a.sumy.arytmetykaOk,
+      kompletne: a.sumy.kompletne,
+      kompletnosc: a.sumy.kompletnosc,
+      braki: a.sumy.braki,
       kontroleOk: a.sumy.kontroleOk,
       bledyGlobalne: a.bledyGlobalne,
       ostrzezenia: a.ostrzezenia,
       ...extra
     };
+  }
+
+  // Bramka PREPARE/APPROVE: odczyty API kompletne, arytmetyka sum
+  // zgodna, a braki kompletności rozstrzygnięte albo jawnie wyłączone.
+  function bramkaDanych(a, akceptujNiekompletne) {
+    if (a.bledyGlobalne.length) {
+      return 'Odczyty API niekompletne: ' + a.bledyGlobalne.join(' ');
+    }
+
+    if (!a.sumy.arytmetykaOk) {
+      return 'Kontrole sum nie przeszły — popraw dane i uruchom PREVIEW.';
+    }
+
+    if (!a.sumy.kompletne) {
+      return sprawdzAkceptacjeBrakow(a.sumy.braki, akceptujNiekompletne);
+    }
+
+    return null;
   }
 
   // ======================================================
@@ -2340,7 +2652,12 @@ function createProcess({ gateway, journal, cfg, now, log }) {
     });
 
     log.log('FAKTURY_PREVIEW_SUMY', JSON.stringify(wynik.sumy));
-    log.log('FAKTURY_PREVIEW_KONTROLE', JSON.stringify(wynik.kontroleSum));
+    log.log('FAKTURY_PREVIEW_KONTROLE', JSON.stringify({
+      ...wynik.kontroleSum,
+      arytmetykaOk: wynik.arytmetykaOk,
+      kompletne: wynik.kompletne,
+      braki: wynik.braki
+    }));
     for (const w of tabela) log.log('FAKTURY_PREVIEW_ZAMOWIENIE', JSON.stringify(w));
     for (const p of wynik.proponowaneFaktury) {
       log.log('FAKTURY_PREVIEW_FAKTURA', JSON.stringify(p));
@@ -2382,16 +2699,19 @@ function createProcess({ gateway, journal, cfg, now, log }) {
   // PREPARE — zapis planu w dzienniku (bez Wix Invoices)
   // ======================================================
 
-  async function przygotuj({ contactIds = [], maxSekund } = {}) {
+  async function przygotuj({
+    contactIds = [],
+    maxSekund,
+    akceptujNiekompletne
+  } = {}) {
     return zBlokada('PREPARE', async lock => {
       const b = budzet(cfg, maxSekund);
       const { a } = await analiza();
 
-      if (a.bledyGlobalne.length || !a.sumy.kontroleOk) {
-        return raport('PREPARE', a, {
-          status: 'ODMOWA',
-          blad: 'Kontrole globalne lub sum nie przeszły — popraw dane i uruchom PREVIEW.'
-        });
+      const odmowa = bramkaDanych(a, akceptujNiekompletne);
+
+      if (odmowa) {
+        return raport('PREPARE', a, { status: 'ODMOWA', blad: odmowa });
       }
 
       const wyniki = [];
@@ -2466,10 +2786,35 @@ function createProcess({ gateway, journal, cfg, now, log }) {
     operationIds = [],
     wszystkie = false,
     oczekiwanaLiczba,
-    oczekiwanaSuma
+    oczekiwanaSuma,
+    audytFaktur,
+    akceptujNiekompletne
   } = {}) {
+    // R1: API nie wykrywa faktur wystawionych poza dziennikiem.
+    // Administrator deklaruje, że sprawdził panel Faktury za miesiąc.
+    if (
+      audytFaktur?.sprawdzono !== true ||
+      !String(audytFaktur?.kto || '').trim() ||
+      !String(audytFaktur?.zakres || '').trim()
+    ) {
+      return {
+        tryb: 'APPROVE',
+        status: 'ODMOWA',
+        blad:
+          'Wymagany audytFaktur: { sprawdzono: true, kto, zakres } — ' +
+          'potwierdzenie, że w panelu Faktury nie ma faktur za ten miesiąc ' +
+          'dla zatwierdzanych klientów poza dziennikiem.'
+      };
+    }
+
     return zBlokada('APPROVE', async lock => {
       const { a, stan } = await analiza({ zKontaktami: false });
+
+      const odmowaDanych = bramkaDanych(a, akceptujNiekompletne);
+
+      if (odmowaDanych) {
+        return { tryb: 'APPROVE', status: 'ODMOWA', blad: odmowaDanych };
+      }
 
       const kandydaci = [...stan.operacje.values()].filter(op =>
         op.miesiac === cfg.miesiac &&
@@ -2520,8 +2865,24 @@ function createProcess({ gateway, journal, cfg, now, log }) {
         const nowy = await journal.zmien(
           op,
           S.PREPARED,
-          { status: S.APPROVED, zatwierdzono: now().toISOString() },
-          `APPROVE (${kandydaci.length} faktur, ${zl(suma)} zł)`
+          {
+            status: S.APPROVED,
+            zatwierdzono: now().toISOString(),
+            // Trwały audyt powiązany z miesiącem, kontaktem,
+            // zamówieniami i wersją danych (fingerprint).
+            audytFaktur: {
+              sprawdzono: true,
+              kto: String(audytFaktur.kto).trim(),
+              zakres: String(audytFaktur.zakres).trim(),
+              data: now().toISOString(),
+              miesiac: cfg.miesiac,
+              contactId: op.klientContactId,
+              orderIds: op.orderIds,
+              fingerprint: op.fingerprint,
+              akceptowaneBraki: a.sumy.kompletne ? null : a.sumy.braki
+            }
+          },
+          `APPROVE (${kandydaci.length} faktur, ${zl(suma)} zł), audyt: ${audytFaktur.kto}`
         );
         wyniki.push(opisOperacji(nowy));
       }
@@ -2679,7 +3040,7 @@ function createProcess({ gateway, journal, cfg, now, log }) {
       op = await doPrzegladu(
         op,
         S.APPROVED,
-        'ZMIANA_DANYCH',
+        weryfikacja?.brakAudytu ? 'BRAK_AUDYTU' : 'ZMIANA_DANYCH',
         (weryfikacja?.problemy || ['Brak weryfikacji.']).join(' ')
       );
       return { op };
@@ -2920,15 +3281,12 @@ function createProcess({ gateway, journal, cfg, now, log }) {
           if (!invoiceId) return odmowa('Podaj invoiceId z panelu Faktury.');
 
           const f = await gateway.pobierzFakture(invoiceId);
-          const problemy = sprawdzFakture(f, { ...op, invoiceId });
-          const ref = f?.metadata?.sourceRefId;
-
-          if (ref !== op._id && !potwierdzam) {
-            problemy.push(
-              'Faktura nie ma metadata.sourceRefId tej operacji — ' +
-              'jeśli to na pewno ta faktura, podaj potwierdzam: true.'
-            );
-          }
+          // Pełna zgodność treści z planem jest wymagana zawsze.
+          // Brak metadata.sourceRefId (np. faktura wystawiona ręcznie)
+          // dopuszczalny tylko z potwierdzam: true; inny sourceRefId — nigdy.
+          const problemy = sprawdzFakture(f, { ...op, invoiceId }, {
+            bezRef: potwierdzam
+          });
 
           if (problemy.length) return odmowa(problemy.join(' '));
 

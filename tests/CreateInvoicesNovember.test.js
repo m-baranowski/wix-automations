@@ -394,13 +394,17 @@ function srodowisko(spec, zmianyCfg = {}) {
 }
 
 // PREPARE + APPROVE wszystkiego, co pokazał PREVIEW.
-async function przygotujIZatwierdz(env) {
-  const p = await env.proces.przygotuj();
+const AUDYT = { sprawdzono: true, kto: 'Administrator testowy', zakres: 'panel Faktury, listopad 2026' };
+
+async function przygotujIZatwierdz(env, opcje = {}) {
+  const p = await env.proces.przygotuj(opcje);
   if (p.status !== 'OK') throw new Error(`PREPARE: ${p.blad}`);
   return env.proces.zatwierdz({
     wszystkie: true,
     oczekiwanaLiczba: p.doZatwierdzenia.liczba,
-    oczekiwanaSuma: p.doZatwierdzenia.suma
+    oczekiwanaSuma: p.doZatwierdzenia.suma,
+    audytFaktur: AUDYT,
+    ...opcje
   });
 }
 
@@ -498,8 +502,8 @@ test('pola faktury: kształt wix-billing-backend, PLN, tytuł, termin 5 dni', ()
 });
 
 test('kontrola faktury przed wysyłką wykrywa rozbieżność kwot i kontaktu', () => {
-  const op = { _id: 'op', invoiceId: 'i', klientContactId: 'c', kwotaGrosze: 64000, pozycje: [{}] };
-  const ok = { id: { id: 'i', version: 3 }, customer: { contactId: 'c' }, totals: { total: 640 }, lineItems: [{}], metadata: { sourceRefId: 'op' } };
+  const op = { _id: 'op', invoiceId: 'i', klientContactId: 'c', kwotaGrosze: 64000, rabatFaktury: 0, pozycje: [{ nazwa: 'Terapia logopedyczna', cena: 16000, ilosc: 4 }] };
+  const ok = { id: { id: 'i', version: 3 }, currency: 'PLN', customer: { contactId: 'c' }, totals: { total: 640 }, lineItems: [{ name: 'Terapia logopedyczna', price: 160, quantity: 4 }], metadata: { sourceRefId: 'op' } };
   assert.deepEqual(sprawdzFakture(ok, op), []);
   assert.equal(sprawdzFakture({ ...ok, totals: { total: 480 } }, op).length, 1);
   assert.equal(sprawdzFakture({ ...ok, customer: { contactId: 'x' } }, op).length, 1);
@@ -1097,11 +1101,11 @@ test('APPROVE wymaga zgodnej liczby i sumy', async () => {
     { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1' }] }
   ]);
   await env.proces.przygotuj();
-  const zle = await env.proces.zatwierdz({ wszystkie: true, oczekiwanaLiczba: 1, oczekiwanaSuma: '600.00' });
+  const zle = await env.proces.zatwierdz({ wszystkie: true, oczekiwanaLiczba: 1, oczekiwanaSuma: '600.00', audytFaktur: AUDYT });
   assert.equal(zle.status, 'ODMOWA');
   const r = await env.proces.wykonaj();
   assert.equal(r.wyniki.length, 0, 'bez zatwierdzenia RUN nic nie robi');
-  const ok = await env.proces.zatwierdz({ wszystkie: true, oczekiwanaLiczba: 1, oczekiwanaSuma: '640.00' });
+  const ok = await env.proces.zatwierdz({ wszystkie: true, oczekiwanaLiczba: 1, oczekiwanaSuma: '640.00', audytFaktur: AUDYT });
   assert.equal(ok.status, 'OK');
 });
 
@@ -1184,4 +1188,264 @@ test('stara blokada wymaga decyzji administratora', async () => {
   assert.equal((await env.proces.zwolnijBlokade()).status, 'ODMOWA');
   assert.equal((await env.proces.zwolnijBlokade({ potwierdzam: true })).status, 'ZWOLNIONA');
   assert.notEqual((await env.proces.wykonaj()).status, 'LOCK_REVIEW');
+});
+
+// ======================================================
+// REGRESJA PRZEGLĄDU reviews/november-944a44c.md (R1–R4)
+// ======================================================
+
+const DZIENNIK = KONFIGURACJA_LISTOPAD_2026.kolekcje.dziennik;
+const CYKLE = KONFIGURACJA_LISTOPAD_2026.kolekcje.umowyMiesiace;
+
+const jedenKlient = (umowy = [{ umowaId: 'u1' }]) => srodowisko([
+  { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy }
+]);
+
+// ---------------- R1 ----------------
+
+test('R1: faktura standalone poza dziennikiem jest niewidoczna dla API — APPROVE wymaga audytu', async () => {
+  const env = jedenKlient();
+  // Order Invoices puste, brak transakcji: API nie odróżni tego od braku faktury.
+  const p = await env.proces.przygotuj();
+  const bez = await env.proces.zatwierdz({ wszystkie: true, oczekiwanaLiczba: 1, oczekiwanaSuma: '640.00' });
+  assert.equal(bez.status, 'ODMOWA');
+  assert.match(bez.blad, /audytFaktur/);
+
+  const niepelny = await env.proces.zatwierdz({
+    wszystkie: true, oczekiwanaLiczba: 1, oczekiwanaSuma: '640.00',
+    audytFaktur: { sprawdzono: true, kto: '', zakres: 'x' }
+  });
+  assert.equal(niepelny.status, 'ODMOWA');
+
+  const r = await env.proces.wykonaj({ maxOperacji: 5 });
+  assert.equal(r.wyniki.length, 0);
+  assert.equal(env.inv.utworzenia, 0);
+  assert.equal(p.doZatwierdzenia.liczba, 1);
+});
+
+test('R1: audyt zapisany trwale z miesiącem, kontaktem, orderIds i fingerprintem', async () => {
+  const env = jedenKlient([{ umowaId: 'u1' }, { umowaId: 'u2', cena: 180 }]);
+  await przygotujIZatwierdz(env);
+  const [op] = await env.db.find(DZIENNIK, { rodzaj: 'FAKTURA' });
+  assert.equal(op.audytFaktur.kto, AUDYT.kto);
+  assert.equal(op.audytFaktur.miesiac, '2026-11');
+  assert.equal(op.audytFaktur.contactId, ANNA);
+  assert.deepEqual(op.audytFaktur.orderIds, ['ord-u1', 'ord-u2']);
+  assert.equal(op.audytFaktur.fingerprint, op.fingerprint);
+});
+
+test('R1: nieaktualny audyt (inna wersja danych) — brak faktury, NEEDS_REVIEW/BRAK_AUDYTU', async () => {
+  const env = jedenKlient();
+  await przygotujIZatwierdz(env);
+  const kol = env.db.kolekcje.get(DZIENNIK);
+  const op = [...kol.values()].find(x => x.rodzaj === 'FAKTURA');
+  op.audytFaktur.fingerprint = 'inna-wersja';
+
+  const r = await env.proces.wykonaj({ maxOperacji: 1 });
+  assert.equal(r.wyniki[0].status, S.NEEDS_REVIEW);
+  assert.equal(r.wyniki[0].powodPrzegladu, 'BRAK_AUDYTU');
+  assert.equal(env.inv.utworzenia, 0);
+});
+
+test('R1: brak audytu w operacji APPROVED (np. edycja ręczna) — brak faktury', async () => {
+  const env = jedenKlient();
+  await przygotujIZatwierdz(env);
+  const op = [...env.db.kolekcje.get(DZIENNIK).values()].find(x => x.rodzaj === 'FAKTURA');
+  delete op.audytFaktur;
+  const r = await env.proces.wykonaj({ maxOperacji: 1 });
+  assert.equal(r.wyniki[0].powodPrzegladu, 'BRAK_AUDYTU');
+  assert.equal(env.inv.utworzenia, 0);
+});
+
+test('R1: wpis listopada w starym formacie (bez rodzaj) — klient do sprawdzenia', async () => {
+  const env = jedenKlient();
+  await env.db.insert(DZIENNIK, {
+    _id: 'legacy-1', miesiac: '2026-11', klientContactId: ANNA,
+    status: 'WYSLANA', invoiceId: 'inv-reczna', orderIds: []
+  });
+  const p = await env.proces.podglad();
+  assert.equal(kat(p, 'ord-u1'), K.DO_SPRAWDZENIA);
+  assert.match(p.doRecznejDecyzji[0].powod, /legacy-1/);
+  assert.equal(p.proponowaneFaktury.length, 0);
+});
+
+test('R1: stary wpis bez kontaktu — brak kompletności, PREPARE wymaga jawnej akceptacji', async () => {
+  const env = jedenKlient();
+  await env.db.insert(DZIENNIK, { _id: 'legacy-2', miesiac: '2026-11', status: 'TWORZENIE' });
+  const p = await env.proces.podglad();
+  assert.equal(p.kontroleOk, false);
+  assert.deepEqual(p.braki.wpisyDziennika, ['legacy-2']);
+  assert.equal((await env.proces.przygotuj()).status, 'ODMOWA');
+  const ok = await env.proces.przygotuj({ akceptujNiekompletne: { orderIds: [], umowaIds: [], wpisyDziennika: ['legacy-2'] } });
+  assert.equal(ok.status, 'OK');
+});
+
+// ---------------- R2 ----------------
+
+const opPlan = {
+  _id: 'op', invoiceId: 'i', klientContactId: 'c', kwotaGrosze: 48000, rabatFaktury: 0,
+  pozycje: [
+    { nazwa: 'Terapia logopedyczna', cena: 16000, ilosc: 4 },
+    { nazwa: 'Rabat', cena: -16000, ilosc: 1 }
+  ]
+};
+const fakturaZgodna = () => ({
+  id: { id: 'i', version: 2 }, currency: 'PLN', customer: { contactId: 'c' },
+  metadata: { sourceRefId: 'op' }, totals: { total: 480 },
+  lineItems: [
+    { name: 'Terapia logopedyczna', price: 160, quantity: 4 },
+    { name: 'Rabat', price: -160, quantity: 1 }
+  ]
+});
+
+test('R2: zgodna faktura przechodzi kontrolę', () => {
+  assert.deepEqual(sprawdzFakture(fakturaZgodna(), opPlan), []);
+});
+
+test('R2: zmieniony rabat przy zachowanej sumie końcowej — odrzucone', () => {
+  const f = fakturaZgodna();
+  f.lineItems = [
+    { name: 'Terapia logopedyczna', price: 160, quantity: 3 },
+    { name: 'Rabat', price: 0, quantity: 1 }
+  ];
+  const p = sprawdzFakture(f, opPlan);
+  assert.ok(p.some(x => /ilość/.test(x)));
+  assert.ok(p.some(x => /cena/.test(x)));
+});
+
+test('R2: zmieniona usługa, ilość i cena przy tej samej liczbie pozycji i sumie — odrzucone', () => {
+  const f = fakturaZgodna();
+  f.lineItems[0] = { name: 'Inna usługa', price: 640, quantity: 1 };
+  f.lineItems[1] = { name: 'Rabat', price: -160, quantity: 1 };
+  assert.ok(sprawdzFakture(f, opPlan).some(x => /nazwa/.test(x)));
+});
+
+test('R2: brak waluty, brak sourceRefId, inny rabat faktury — odrzucone', () => {
+  const bezWaluty = fakturaZgodna();
+  delete bezWaluty.currency;
+  assert.ok(sprawdzFakture(bezWaluty, opPlan).some(x => /Waluta/.test(x)));
+
+  const bezRef = fakturaZgodna();
+  delete bezRef.metadata;
+  assert.ok(sprawdzFakture(bezRef, opPlan).some(x => /sourceRefId/.test(x)));
+  // Wyjątek jawny: tylko przy decyzji administratora (potwierdzam).
+  assert.deepEqual(sprawdzFakture(bezRef, opPlan, { bezRef: true }), []);
+
+  const innyRef = fakturaZgodna();
+  innyRef.metadata.sourceRefId = 'cudza';
+  assert.ok(sprawdzFakture(innyRef, opPlan, { bezRef: true }).length > 0);
+
+  const rabat = fakturaZgodna();
+  rabat.discount = { value: 10, type: 'Fixed' };
+  assert.ok(sprawdzFakture(rabat, opPlan).some(x => /Rabat faktury/.test(x)));
+});
+
+test('R2: faktura zmieniona między utworzeniem a wysyłką — bez wysyłki', async () => {
+  const env = jedenKlient();
+  await przygotujIZatwierdz(env);
+  await env.proces.wykonaj({ maxOperacji: 1, etap: 'UTWORZ' });
+  const f = env.inv.faktury.get('inv-1');
+  f.lineItems[0].name = 'Inna usługa';
+  const r = await env.proces.wykonaj({ maxOperacji: 1, etap: 'WYSLIJ' });
+  assert.equal(r.wyniki[0].powodPrzegladu, 'INVOICE_MISMATCH');
+  assert.equal(env.inv.wysylki, 0);
+});
+
+test('R2: RESOLVE FAKTURA_ISTNIEJE nie przypnie innej faktury o tej samej kwocie', async () => {
+  const env = jedenKlient();
+  await przygotujIZatwierdz(env);
+  env.inv.awariaTworzenia = 'przed';
+  const r = await env.proces.wykonaj({ maxOperacji: 1 });
+  const op = r.doRecznejDecyzji[0].operationId;
+  env.inv.awariaTworzenia = null;
+
+  // Ręcznie wystawiona faktura: ta sama kwota i kontakt, inna treść, bez sourceRefId.
+  await env.inv.createInvoice({
+    title: 'Listopad 2026', currency: 'PLN', customer: { contactId: ANNA },
+    lineItems: [{ id: '1', name: 'Konsultacja', price: 640, quantity: 1 }]
+  });
+  const res = await env.proces.rozstrzygnij({ operationId: op, decyzja: 'FAKTURA_ISTNIEJE', invoiceId: 'inv-1', potwierdzam: true });
+  assert.equal(res.status, 'ODMOWA');
+  assert.match(res.blad, /nazwa|ilość/);
+});
+
+// ---------------- R3 ----------------
+
+test('R3: brak ceny, subtotal lub total — kwota nieznana, nie zero', () => {
+  const raw = zamowienie({ id: 'o', numer: 1, contactId: 'c', umowaId: 'u' });
+  delete raw.lineItems[0].price;
+  assert.throws(() => normalizujZamowienie(raw), /cena pozycji/);
+
+  const bezTotal = zamowienie({ id: 'o', numer: 1, contactId: 'c', umowaId: 'u' });
+  delete bezTotal.priceSummary.total;
+  assert.throws(() => normalizujZamowienie(bezTotal), /total/);
+
+  const bezPozycji = zamowienie({ id: 'o', numer: 1, contactId: 'c', umowaId: 'u' });
+  bezPozycji.lineItems = [];
+  assert.throws(() => normalizujZamowienie(bezPozycji), /bez pozycji/);
+});
+
+test('R3: nieprawidłowe typy kwot odrzucane', () => {
+  assert.throws(() => grosze(true), /Nieprawidłowa/);
+  assert.throws(() => grosze('1e3'), /Nieprawidłowa/);
+  assert.throws(() => grosze({ amount: [] }), /Nieprawidłowa/);
+  assert.throws(() => grosze(1e20), /zakresem/);
+  assert.equal(grosze(' 12.50 '), 1250);
+});
+
+test('R3: zamówienie bez kwot w procesie — DO_SPRAWDZENIA z kwotą NIEZNANA', async () => {
+  const env = jedenKlient();
+  const o = env.w.orders.get('ord-u1');
+  delete o.lineItems[0].price;
+  env.db.kolekcje.get(CYKLE).get('um-u1').kwota = undefined;
+  const p = await env.proces.podglad();
+  const w = p.tabela.find(x => x.orderId === 'ord-u1');
+  assert.equal(w.kategoria, K.DO_SPRAWDZENIA);
+  assert.equal(w.netto, 'NIEZNANA');
+  assert.equal(p.sumy.nieznanychKwot, 1);
+  assert.equal(p.kontroleOk, false);
+  assert.equal(p.proponowaneFaktury.length, 0);
+});
+
+// ---------------- R4 ----------------
+
+test('R4: ten sam orderId w dwóch cyklach — liczony raz, brak kompletności', async () => {
+  const env = jedenKlient();
+  const kopiaWiersza = { ...env.db.kolekcje.get(CYKLE).get('um-u1'), _id: 'um-u1-dup', umowaId: 'u1-dup' };
+  env.db.kolekcje.get(CYKLE).set(kopiaWiersza._id, kopiaWiersza);
+  const p = await env.proces.podglad();
+  assert.equal(p.sumy.netto, '640.00');
+  assert.deepEqual(p.kompletnosc.zdublowaneOrderId, ['ord-u1']);
+  assert.equal(p.arytmetykaOk, true);
+  assert.equal(p.kompletne, false);
+  assert.equal(p.kontroleOk, false);
+  assert.equal(p.proponowaneFaktury.length, 0);
+});
+
+test('R4: cykl bez orderId i nieodczytane zamówienie bez kwoty — jawne braki', async () => {
+  const env = jedenKlient([{ umowaId: 'u1' }, { umowaId: 'u2' }, { umowaId: 'u3' }]);
+  const cykle = env.db.kolekcje.get(CYKLE);
+  Object.assign(cykle.get('um-u2'), { orderId: '', status: 'RUNNING' });
+  env.w.orders.delete('ord-u3');
+  cykle.get('um-u3').kwota = 0;
+
+  const p = await env.proces.podglad();
+  assert.deepEqual(p.braki.umowaIds, ['u2']);
+  assert.deepEqual(p.braki.orderIds, ['ord-u3']);
+  assert.deepEqual(p.kompletnosc.bezKwoty, ['ord-u3']);
+  assert.equal(p.kontroleOk, false);
+  assert.equal(p.gotoweDoPrzygotowania, false);
+
+  // Częściowa akceptacja nie wystarcza.
+  const czesc = await env.proces.przygotuj({ akceptujNiekompletne: { orderIds: ['ord-u3'], umowaIds: [], wpisyDziennika: [] } });
+  assert.equal(czesc.status, 'ODMOWA');
+
+  // Dokładna akceptacja: faktura tylko dla zamówienia, które jest jasne.
+  const akc = { orderIds: ['ord-u3'], umowaIds: ['u2'], wpisyDziennika: [] };
+  await przygotujIZatwierdz(env, { akceptujNiekompletne: akc });
+  await wykonajWszystko(env);
+  assert.equal(env.inv.utworzenia, 1);
+  assert.equal([...env.inv.faktury.values()][0].totals.total, 640);
+  const [op] = await env.db.find(DZIENNIK, { rodzaj: 'FAKTURA' });
+  assert.deepEqual(op.audytFaktur.akceptowaneBraki, akc);
 });
