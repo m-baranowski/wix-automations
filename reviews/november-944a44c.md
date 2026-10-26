@@ -116,3 +116,16 @@ Wykonane wyłącznie zapytania odczytu (CMS Query Data Items, Get Data Collectio
 5. Zamówienie PAID ma 0 zł — skrypt klasyfikuje je jako ZEROWE (poprawnie, przed regułą PAID).
 
 Ujemna cena pozycji w Invoices V1 i rzeczywisty kształt `getInvoice` pozostają niezweryfikowane (niedostępne przez REST).
+
+### Odpowiedź na rozbieżności z odczytu danych — commit c61295b
+
+| Nr | Zmiana | Test |
+| --- | --- | --- |
+| 1 | `kluczZgodny`: akceptuje `TOTO:2026-11:{umowa}`, `:repairN`, `/restoreN`, `2026-11/{umowa}` i brak klucza; inny klucz → DO_SPRAWDZENIA. Kontakt i zbiór bookingId muszą nadal zgadzać się z cyklem. | `Dane:` formaty klucza; brak klucza + zgodne wizyty; brak klucza + obca wizyta |
+| 2 | Indeks kluczy obejmuje oba formaty i przechowuje status; anulowane zamówienia nie są duplikatem, aktywne — tak. | `Dane:` naprawione zamówienie z anulowanym poprzednikiem / z aktywnym drugim zamówieniem |
+| 3 | Cykl DONE + zamówienie CANCELED → DO_SPRAWDZENIA (kwota w „do sprawdzenia”, nie w „anulowane”). | `Dane:` cykl DONE z anulowanym zamówieniem |
+| 4 | Daty w opisie pozycji tylko przy odczycie ze wszystkich linii. | `Dane:` daty w opisie |
+| 5 | Bez zmian (już poprawne). | `Dane:` PAID 0 zł → ZEROWE; rabat `"160"` rozłożony na pozycje |
+| — | Tryb `PROBE` (Velo, tylko odczyt): struktura `getInvoice` bez danych osobowych, `brakujaceDlaKontroli`. Odpowiada na niezweryfikowany kształt odpowiedzi V1; ujemna cena nadal wymaga osobnej decyzji. | `PROBE:` |
+
+`npm test`: 71/71. Ponowny przegląd: oczekuje.
