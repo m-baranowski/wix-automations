@@ -1,17 +1,524 @@
-// Testy scenariuszowe fakturowania listopada 2026 (atrapy API Wix).
-// Numeracja = lista wymaganych przypadków.
+// Testy CreateInvoicesNovember.js — wyłącznie atrapy API Wix.
+// Żadne wywołanie nie wychodzi poza proces; nie powstają prawdziwe faktury.
+// Uruchomienie: npm test
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { _test } from '../CreateInvoicesNovember.js';
 
-import {
-  srodowisko,
-  przygotujIZatwierdz,
-  wykonajWszystko,
-  swiat,
-  zamowienie
-} from './atrapy.js';
-import { K, S } from '../faktury/rozliczenia.js';
+const {
+  KONFIGURACJA_LISTOPAD_2026,
+  K,
+  S,
+  LOCK_ID,
+  GENERATOR_LOCK_ID,
+  grosze,
+  normalizujZamowienie,
+  zbudujPlan,
+  operationId,
+  polaFaktury,
+  sprawdzFakture,
+  wyciagnijKontakt,
+  createJournal,
+  createProcess
+} = _test;
+
+// ======================================================
+// ATRAPY
+// ======================================================
+
+
+const MIESIAC = '2026-11';
+const APP = KONFIGURACJA_LISTOPAD_2026.appIdRezerwacji;
+
+const money = c => ({ amount: (c / 100).toFixed(2) });
+const kopia = x => (x === undefined ? x : JSON.parse(JSON.stringify(x)));
+
+const cfgTest = (zmiany = {}) => ({
+  ...KONFIGURACJA_LISTOPAD_2026,
+  minZapasMs: 0,
+  ...zmiany
+});
+
+// ------------------------------------------------------
+// Dane źródłowe
+// ------------------------------------------------------
+
+/**
+ * Zamówienie w kształcie SDK @wix/ecom (jak z generatorUmow.js),
+ * z opcjonalnymi rabatami merchantDiscount (rabat za październik).
+ */
+function zamowienie({
+  id,
+  numer,
+  contactId,
+  umowaId,
+  usluga = 'Terapia logopedyczna',
+  cena = 160,
+  wizyty = 4,
+  rabaty = [],
+  status = 'APPROVED',
+  paymentStatus = 'NOT_PAID',
+  zaplacono = 0,
+  externalOrderId
+}) {
+  const c = Math.round(cena * 100);
+  const daty = ['2026-11-03', '2026-11-10', '2026-11-17', '2026-11-24', '2026-11-26'];
+
+  const lineItems = Array.from({ length: wizyty }, (_, i) => ({
+    _id: `bk-${id}-${i}`,
+    productName: { original: usluga },
+    quantity: 1,
+    catalogReference: { appId: APP, catalogItemId: `bk-${id}-${i}` },
+    price: money(c),
+    totalDiscount: money(0),
+    totalPriceAfterTax: money(c),
+    descriptionLines: [{
+      name: { original: 'Termin pierwotny / miesiąc rozliczenia' },
+      plainText: { original: `${daty[i % daty.length]} 16:00 / ${MIESIAC}` }
+    }]
+  }));
+
+  const subtotal = c * wizyty;
+  const rab = rabaty.map((r, i) => ({
+    _id: r.id || `rabat-${id}-${i}`,
+    discountType: 'GLOBAL',
+    merchantDiscount: {
+      amount: money(Math.round(r.kwota * 100)),
+      description: r.opis || 'Odwołana wizyta — październik 2026'
+    }
+  }));
+  const discount = rabaty.reduce((s, r) => s + Math.round(r.kwota * 100), 0);
+  const total = subtotal - discount;
+  const paid = Math.round(zaplacono * 100);
+
+  return {
+    _id: id,
+    number: String(numer),
+    status,
+    paymentStatus,
+    currency: 'PLN',
+    buyerInfo: { contactId },
+    channelInfo: {
+      type: 'BACKOFFICE_MERCHANT',
+      externalOrderId: externalOrderId || `TOTO:${MIESIAC}:${umowaId}`
+    },
+    lineItems,
+    appliedDiscounts: rab,
+    priceSummary: {
+      subtotal: money(subtotal),
+      discount: money(discount),
+      tax: money(0),
+      shipping: money(0),
+      total: money(total)
+    },
+    balanceSummary: {
+      paid: money(paid),
+      balance: money(total - paid),
+      refunded: money(0)
+    }
+  };
+}
+
+function wierszCyklu(order, { umowaId, stawka, status = 'DONE' }) {
+  return {
+    _id: `um-${umowaId}`,
+    title: `${MIESIAC} | ${umowaId}`,
+    miesiac: MIESIAC,
+    umowaId,
+    klientContactId: order.buyerInfo.contactId,
+    status,
+    orderId: order._id,
+    stawka,
+    kwota: stawka * order.lineItems.length,
+    stan: {
+      plan: order.lineItems.map(li => ({
+        status: 'BOOKED',
+        bookingId: li.catalogReference.catalogItemId
+      }))
+    }
+  };
+}
+
+/**
+ * Buduje świat testowy: klienci -> umowy -> zamówienia.
+ * spec: [{ contactId, nazwa, email, umowy: [{ umowaId, ...opcje zamówienia }] }]
+ */
+function swiat(spec) {
+  const w = {
+    rows: [],
+    umowy: new Map(),
+    orders: new Map(),
+    kontakty: new Map(),
+    fakturyWix: new Map(),
+    transakcje: new Map(),
+    dodatkoweKlucze: new Map()
+  };
+
+  let numer = 1000;
+
+  for (const k of spec) {
+    w.kontakty.set(k.contactId, {
+      _id: k.contactId,
+      info: {
+        name: { first: k.imie || k.nazwa.split(' ')[0], last: k.nazwisko || k.nazwa.split(' ').slice(1).join(' ') },
+        emails: k.email ? [{ email: k.email, primary: true }] : [],
+        phones: k.telefon ? [{ phone: k.telefon, primary: true }] : []
+      },
+      primaryInfo: { email: k.email, phone: k.telefon }
+    });
+
+    for (const u of k.umowy) {
+      const id = u.orderId || `ord-${u.umowaId}`;
+      const o = zamowienie({ ...u, id, numer: ++numer, contactId: k.contactId });
+      w.orders.set(id, o);
+      w.umowy.set(u.umowaId, {
+        _id: u.umowaId,
+        klientContactId: k.contactId,
+        klientNazwa: k.nazwa,
+        stawka: u.cena ?? 160
+      });
+      w.rows.push(wierszCyklu(o, { umowaId: u.umowaId, stawka: u.cena ?? 160, status: u.statusCyklu }));
+
+      if (u.fakturyWix) w.fakturyWix.set(id, u.fakturyWix);
+      if (u.platnosci) w.transakcje.set(id, { payments: u.platnosci, refunds: [] });
+    }
+  }
+
+  return w;
+}
+
+// ------------------------------------------------------
+// CMS (wix-data) w pamięci
+// ------------------------------------------------------
+
+function bazaDanych() {
+  const kolekcje = new Map();
+  const kol = n => {
+    if (!kolekcje.has(n)) kolekcje.set(n, new Map());
+    return kolekcje.get(n);
+  };
+
+  const db = {
+    kolekcje,
+    // (operacja, kolekcja, element) => true wymusza wyjątek
+    awaria: null,
+    zapisy: 0,
+
+    async get(c, id) {
+      await Promise.resolve();
+      return kopia(kol(c).get(id) || null);
+    },
+
+    async insert(c, item) {
+      await Promise.resolve();
+      if (db.awaria?.('insert', c, item)) throw new Error('awaria insert');
+      if (kol(c).has(item._id)) throw new Error('WDE0074: item already exists');
+      const zapis = { ...kopia(item), _createdDate: new Date().toISOString() };
+      kol(c).set(item._id, zapis);
+      db.zapisy++;
+      return kopia(zapis);
+    },
+
+    async update(c, item) {
+      await Promise.resolve();
+      if (db.awaria?.('update', c, item)) throw new Error('awaria update (timeout)');
+      if (!kol(c).has(item._id)) throw new Error('WDE0073: not found');
+      kol(c).set(item._id, { ...kopia(item), _createdDate: kol(c).get(item._id)._createdDate });
+      db.zapisy++;
+      return kopia(item);
+    },
+
+    async remove(c, id) {
+      await Promise.resolve();
+      kol(c).delete(id);
+    },
+
+    async find(c, eq = {}) {
+      await Promise.resolve();
+      return [...kol(c).values()]
+        .filter(x => Object.entries(eq).every(([k, v]) => x[k] === v))
+        .map(kopia);
+    },
+
+    async byIds(c, ids) {
+      return [...kol(c).values()].filter(x => ids.includes(x._id)).map(kopia);
+    }
+  };
+
+  return db;
+}
+
+// ------------------------------------------------------
+// Wix Invoices (wix-billing-backend) w pamięci
+// ------------------------------------------------------
+
+function fakturyWix() {
+  const f = {
+    faktury: new Map(),
+    utworzenia: 0,
+    wysylki: 0,
+    licznik: 0,
+    // 'przed' — wyjątek bez utworzenia; 'po' — faktura powstaje, potem wyjątek
+    awariaTworzenia: null,
+    awariaWysylki: null,
+    odrzucUjemne: false,
+
+    async createInvoice(pola) {
+      if (f.awariaTworzenia === 'przed') throw new Error('createInvoice: 503');
+      if (f.odrzucUjemne && pola.lineItems.some(l => l.price < 0)) {
+        throw new Error('INVALID_ARGUMENT: price must be >= 0');
+      }
+
+      const id = `inv-${++f.licznik}`;
+      const subtotal = pola.lineItems.reduce(
+        (s, l) => s + Math.round(l.price * 100) * l.quantity, 0
+      );
+      const rabat = pola.discount ? Math.round(pola.discount.value * 100) : 0;
+
+      f.faktury.set(id, {
+        id: { id, version: 1 },
+        status: 'Draft',
+        title: pola.title,
+        currency: pola.currency,
+        customer: kopia(pola.customer),
+        lineItems: kopia(pola.lineItems),
+        discount: kopia(pola.discount),
+        metadata: kopia(pola.metadata),
+        dates: pola.dates,
+        totals: { subtotal: subtotal / 100, total: (subtotal - rabat) / 100 },
+        wasSent: false
+      });
+      f.utworzenia++;
+
+      if (f.awariaTworzenia === 'po') {
+        f.awariaTworzenia = null;
+        throw new Error('createInvoice: deadline exceeded');
+      }
+
+      return { id: { id, version: 1 } };
+    },
+
+    async getInvoice(id) {
+      const x = f.faktury.get(id);
+      if (!x) throw new Error('NOT_FOUND');
+      return kopia(x);
+    },
+
+    async sendInvoice(idAndVersion, email) {
+      if (!idAndVersion || typeof idAndVersion.id !== 'string') {
+        throw new Error('sendInvoice wymaga płaskiego { id, version }');
+      }
+      const x = f.faktury.get(idAndVersion.id);
+      if (!x) throw new Error('NOT_FOUND');
+      if (x.id.version !== idAndVersion.version) throw new Error('VERSION_MISMATCH');
+      if (f.awariaWysylki === 'przed') throw new Error('sendInvoice: 503');
+
+      x.wasSent = true;
+      x.status = 'Sent';
+      x.id.version++;
+      x.email = email;
+      f.wysylki++;
+
+      if (f.awariaWysylki === 'po') {
+        f.awariaWysylki = null;
+        throw new Error('sendInvoice: timeout');
+      }
+    }
+  };
+
+  return f;
+}
+
+// ------------------------------------------------------
+// Bramka + proces
+// ------------------------------------------------------
+
+function srodowisko(spec, zmianyCfg = {}) {
+  const cfg = cfgTest(zmianyCfg);
+  const w = Array.isArray(spec) ? swiat(spec) : spec;
+  const db = bazaDanych();
+  const inv = fakturyWix();
+  const zdarzenia = [];
+
+  const cykle = new Map(w.rows.map(r => [r._id, r]));
+  db.kolekcje.set(cfg.kolekcje.umowyMiesiace, cykle);
+
+  const gateway = {
+    db,
+    awariaApi: {},
+    wierszeCykli: () => db.find(cfg.kolekcje.umowyMiesiace, { miesiac: cfg.miesiac }),
+    umowy: async ids => new Map(ids.filter(id => w.umowy.has(id)).map(id => [id, kopia(w.umowy.get(id))])),
+    zamowienia: async ids => new Map(ids.map(id =>
+      [id, w.orders.has(id) ? { raw: kopia(w.orders.get(id)) } : { error: 'getOrder: NOT_FOUND' }]
+    )),
+    indeksKluczy: async klucze => {
+      if (gateway.awariaApi.indeks) return null;
+      const m = new Map();
+      for (const o of [...w.orders.values(), ...w.dodatkoweKlucze.values()]) {
+        const k = o.channelInfo.externalOrderId;
+        if (!klucze.includes(k)) continue;
+        m.set(k, [...(m.get(k) || []), o._id]);
+      }
+      return m;
+    },
+    fakturyZamowien: async ids => {
+      if (gateway.awariaApi.faktury) return null;
+      return new Map(ids.map(id => [id, kopia(w.fakturyWix.get(id) || [])]));
+    },
+    transakcje: async ids => {
+      if (gateway.awariaApi.transakcje) return null;
+      return new Map(ids.map(id => [id, kopia(w.transakcje.get(id) || { payments: [], refunds: [] })]));
+    },
+    kontakt: async id => {
+      zdarzenia.push(['kontakt', id]);
+      if (!w.kontakty.has(id)) throw new Error('contact not found');
+      return kopia(w.kontakty.get(id));
+    },
+    utworzFakture: pola => {
+      zdarzenia.push(['createInvoice', pola.customer.contactId]);
+      return inv.createInvoice(pola);
+    },
+    pobierzFakture: id => inv.getInvoice(id),
+    wyslijFakture: (id, version, email) => {
+      zdarzenia.push(['sendInvoice', id, version]);
+      return inv.sendInvoice({ id, version }, email);
+    }
+  };
+
+  const cicho = { log() {}, warn() {}, error() {} };
+  const journal = createJournal(db, cfg);
+  const proces = createProcess({ gateway, journal, cfg, log: cicho });
+
+  return { cfg, w, db, inv, gateway, journal, proces, zdarzenia };
+}
+
+// PREPARE + APPROVE wszystkiego, co pokazał PREVIEW.
+async function przygotujIZatwierdz(env) {
+  const p = await env.proces.przygotuj();
+  if (p.status !== 'OK') throw new Error(`PREPARE: ${p.blad}`);
+  return env.proces.zatwierdz({
+    wszystkie: true,
+    oczekiwanaLiczba: p.doZatwierdzenia.liczba,
+    oczekiwanaSuma: p.doZatwierdzenia.suma
+  });
+}
+
+async function wykonajWszystko(env, opcje = {}) {
+  const wyniki = [];
+  for (let i = 0; i < 50; i++) {
+    const r = await env.proces.wykonaj({ maxOperacji: 2, ...opcje });
+    wyniki.push(r);
+    if (!r.wyniki?.length || r.zatrzymano) break;
+  }
+  return wyniki;
+}
+
+// ======================================================
+// TESTY JEDNOSTKOWE — logika rozliczeń
+// ======================================================
+
+const cfg = cfgTest();
+
+
+
+
+test('grosze: kwoty Wix bez błędów zmiennoprzecinkowych', () => {
+  assert.equal(grosze('160.00'), 16000);
+  assert.equal(grosze({ amount: '53.33' }), 5333);
+  assert.equal(grosze(0.1 + 0.2), 30);
+  assert.equal(grosze(undefined), 0);
+  assert.throws(() => grosze('1.005'), /2 miejscami/);
+  assert.throws(() => grosze('abc'), /Nieprawidłowa/);
+});
+
+test('normalizacja: rabat merchantDiscount i uzgodnienie sum', () => {
+  const o = normalizujZamowienie(
+    zamowienie({ id: 'o1', numer: 1, contactId: 'c', umowaId: 'u', rabaty: [{ id: 'd1', kwota: 160 }] })
+  );
+  assert.equal(o.brutto, 64000);
+  assert.equal(o.rabat, 16000);
+  assert.equal(o.razem, 48000);
+  assert.deepEqual(o.rabaty.map(r => [r.discountId, r.kwota]), [['d1', 16000]]);
+  assert.deepEqual(o.problemy, []);
+});
+
+test('normalizacja: niezgodny rabat zgłaszany jako problem', () => {
+  const raw = zamowienie({ id: 'o1', numer: 1, contactId: 'c', umowaId: 'u', rabaty: [{ kwota: 160 }] });
+  raw.priceSummary.discount = { amount: '100.00' };
+  raw.priceSummary.total = { amount: '540.00' };
+  const o = normalizujZamowienie(raw);
+  assert.ok(o.problemy.some(p => /Suma rabatów/.test(p)));
+});
+
+test('normalizacja: podatek lub opłaty blokują automat', () => {
+  const raw = zamowienie({ id: 'o1', numer: 1, contactId: 'c', umowaId: 'u' });
+  raw.priceSummary.tax = { amount: '10.00' };
+  assert.ok(normalizujZamowienie(raw).problemy.length > 0);
+});
+
+test('plan: nie łączy zamówień różnych kontaktów', () => {
+  const a = normalizujZamowienie(zamowienie({ id: 'a', numer: 1, contactId: 'c1', umowaId: 'u1' }));
+  const b = normalizujZamowienie(zamowienie({ id: 'b', numer: 2, contactId: 'c2', umowaId: 'u2' }));
+  assert.throws(() => zbudujPlan('c1', [a, b], cfg), /innego kontaktu/);
+});
+
+test('plan: identyfikator operacji deterministyczny i niezależny od kolejności', () => {
+  assert.equal(operationId('2026-11', 'c', ['b', 'a']), operationId('2026-11', 'c', ['a', 'b']));
+  assert.notEqual(operationId('2026-11', 'c', ['a']), operationId('2026-11', 'c', ['a', 'b']));
+  assert.notEqual(operationId('2026-11', 'c', ['a']), operationId('2026-12', 'c', ['a']));
+});
+
+test('plan: przykład z zadania — 4×160 + 4×180 = 1360 zł, dwie pozycje', () => {
+  const a = normalizujZamowienie(zamowienie({ id: 'a', numer: 1, contactId: 'c', umowaId: 'u1', cena: 160 }));
+  const b = normalizujZamowienie(zamowienie({ id: 'b', numer: 2, contactId: 'c', umowaId: 'u2', cena: 180, usluga: 'Terapia neurologopedyczna' }));
+  const p = zbudujPlan('c', [b, a], cfg);
+  assert.equal(p.razem, 136000);
+  assert.deepEqual(p.pozycje.map(x => [x.nazwa, x.ilosc, x.cena]), [
+    ['Terapia logopedyczna', 4, 16000],
+    ['Terapia neurologopedyczna', 4, 18000]
+  ]);
+  assert.deepEqual(p.orderIds, ['a', 'b']);
+});
+
+test('pola faktury: kształt wix-billing-backend, PLN, tytuł, termin 5 dni', () => {
+  const a = normalizujZamowienie(zamowienie({ id: 'a', numer: 7, contactId: 'c', umowaId: 'u1', rabaty: [{ kwota: 53.33 }] }));
+  const plan = zbudujPlan('c', [a], cfg);
+  const teraz = new Date('2026-12-01T09:00:00Z');
+  const pola = polaFaktury(plan, { contactId: 'c', email: 'x@y.pl', firstName: 'A', lastName: 'B', fullName: 'A B', phone: '48600' }, cfg, teraz);
+
+  assert.equal(pola.title, 'Listopad 2026');
+  assert.equal(pola.currency, 'PLN');
+  assert.equal(pola.customer.phone, '48600');
+  assert.deepEqual(pola.lineItems.map(l => l.price), [160, -53.33]);
+  assert.equal(pola.dates.dueDate.toISOString(), '2026-12-06T09:00:00.000Z');
+  assert.equal(pola.metadata.sourceRefId, plan.operationId);
+  assert.throws(() => polaFaktury(plan, { contactId: 'inny', email: 'x' }, cfg, teraz), /inny|≠/);
+  assert.throws(() => polaFaktury(plan, { contactId: 'c', email: '' }, cfg, teraz), /e-mail/);
+});
+
+test('kontrola faktury przed wysyłką wykrywa rozbieżność kwot i kontaktu', () => {
+  const op = { _id: 'op', invoiceId: 'i', klientContactId: 'c', kwotaGrosze: 64000, pozycje: [{}] };
+  const ok = { id: { id: 'i', version: 3 }, customer: { contactId: 'c' }, totals: { total: 640 }, lineItems: [{}], metadata: { sourceRefId: 'op' } };
+  assert.deepEqual(sprawdzFakture(ok, op), []);
+  assert.equal(sprawdzFakture({ ...ok, totals: { total: 480 } }, op).length, 1);
+  assert.equal(sprawdzFakture({ ...ok, customer: { contactId: 'x' } }, op).length, 1);
+  assert.equal(sprawdzFakture({ ...ok, metadata: { sourceRefId: 'inna' } }, op).length, 1);
+});
+
+test('kontakt: e-mail, telefon, fullName z różnych kształtów odpowiedzi', () => {
+  const k = wyciagnijKontakt({
+    _id: 'c',
+    info: { name: { first: 'Anna', last: 'Nowak' }, emails: { items: [{ email: 'a@x.pl' }] }, phones: { items: [{ phone: '48600' }] } }
+  });
+  assert.deepEqual(k, { contactId: 'c', firstName: 'Anna', lastName: 'Nowak', fullName: 'Anna Nowak', email: 'a@x.pl', phone: '48600' });
+});
+
+// ======================================================
+// TESTY SCENARIUSZOWE — wymagane przypadki 1–18 i zabezpieczenia
+// ======================================================
+
+
 
 const ANNA = 'c-anna';
 const BEATA = 'c-beata';
@@ -437,7 +944,6 @@ test('15b. generator cykli pracuje — fakturowanie czeka', async () => {
   const env = srodowisko([
     { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1' }] }
   ]);
-  const { GENERATOR_LOCK_ID } = await import('../faktury/dziennik.js');
   await env.db.insert(env.cfg.kolekcje.blokady, { _id: GENERATOR_LOCK_ID, token: 't' });
   const r = await env.proces.przygotuj();
   assert.equal(r.status, 'BUSY');
@@ -548,7 +1054,6 @@ test('drugie zamówienie klienta po wystawieniu pierwszej faktury — druga fakt
   await wykonajWszystko(env);
 
   // Później pojawia się drugi, rozliczony cykl tego samego klienta.
-  const { wierszCyklu } = await import('./atrapy.js');
   const o2 = zamowienie({ id: 'ord-u2', numer: 2000, contactId: ANNA, umowaId: 'u2', cena: 180, wizyty: 4, rabaty: [{ kwota: 180 }] });
   w.orders.set('ord-u2', o2);
   w.umowy.set('u2', { _id: 'u2', klientContactId: ANNA, klientNazwa: 'Anna Nowak' });
@@ -671,7 +1176,6 @@ test('stara blokada wymaga decyzji administratora', async () => {
   const env = srodowisko([
     { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1' }] }
   ]);
-  const { LOCK_ID } = await import('../faktury/dziennik.js');
   await env.db.insert(env.cfg.kolekcje.blokady, { _id: LOCK_ID, token: 'x' });
   env.db.kolekcje.get(env.cfg.kolekcje.blokady).get(LOCK_ID)._createdDate = '2026-01-01T00:00:00Z';
 
