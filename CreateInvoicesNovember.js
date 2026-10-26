@@ -20,6 +20,8 @@
  *    (także :repairN, /restoreN), {m}/{umowa} albo brak;
  *  - kwoty w groszach; cena, subtotal i total muszą istnieć (brak ≠ 0);
  *    rabaty appliedDiscounts = priceSummary.discount; total = subtotal − rabat;
+ *  - zamówienie, które ma już fakturę (Order Invoices), jest zawsze
+ *    pomijane — przed innymi kontrolami (ROZLICZONE);
  *  - kategorie: DO_FAKTURY (APPROVED, NOT_PAID, bez faktury i transakcji),
  *    ROZLICZONE (faktura w Wix lub w dzienniku), ANULOWANE (zamówienie
  *    i cykl anulowane), ZEROWE (0 zł), W_PRZYGOTOWANIU (operacja przed
@@ -46,8 +48,9 @@
  *  1. PREVIEW — tylko odczyt. Logi: FAKTURY_PREVIEW_ZAMOWIENIE (tabela),
  *               _FAKTURA (proponowane faktury), _SUMY, _BRAKI,
  *               _DO_ZATWIERDZENIA (liczba i suma wszystkich faktur miesiąca).
- *  2. Sprawdź w panelu Faktury, że klienci z PREVIEW nie mają już faktur
- *     za listopad wystawionych poza dziennikiem (API tego nie wykrywa).
+ *  2. Sprawdź w panelu Faktury, że klienci z PREVIEW nie mają faktur
+ *     za listopad wystawionych BEZ powiązania z zamówieniem (tylko takich
+ *     API nie wykrywa; faktury do zamówień skrypt pomija sam).
  *  3. RUN, OPCJE_RUN: oczekiwanaLiczba i oczekiwanaSuma z PREVIEW,
  *     sprawdzilemPanelFaktur: true, kto: '<imię>', akceptujBraki: ID
  *     z FAKTURY_PREVIEW_BRAKI świadomie pominięte (zwykle []),
@@ -392,12 +395,16 @@ function sprawdzPowiazanie(o, row, umowa) {
 // Kategoria bez uwzględnienia dziennika (używana też przy ponownej
 // weryfikacji operacji przed utworzeniem faktury).
 function klasyfikujBazowo(w) {
+  // Zamówienie z fakturą (Order Invoices) pomijamy zawsze — bez dalszych kontroli.
+  if (w.fakturyWix?.length) {
+    return [K.ROZLICZONE, `Ma fakturę: ${w.fakturyWix.map(idOf).join(', ')} — pominięte.`];
+  }
+
   const o = w.zamowienie;
   if (!o) return [K.DO_SPRAWDZENIA, w.bladZamowienia || 'Nie odczytano zamówienia.'];
 
   if (o.status === 'CANCELED') {
     if (w.row.status === 'DONE') return [K.DO_SPRAWDZENIA, 'Cykl DONE, a zamówienie anulowane — sprawdź wizyty i zamówienie zastępcze.'];
-    if (w.fakturyWix?.length) return [K.DO_SPRAWDZENIA, 'Zamówienie anulowane, ale ma fakturę Wix.'];
     return [K.ANULOWANE, 'Zamówienie anulowane.'];
   }
 
@@ -408,7 +415,6 @@ function klasyfikujBazowo(w) {
   if (problemy.length) return [K.DO_SPRAWDZENIA, problemy.join(' ')];
 
   if (w.fakturyWix === null) return [K.DO_SPRAWDZENIA, 'Nie odczytano faktur zamówienia.'];
-  if (w.fakturyWix.length) return [K.ROZLICZONE, `Faktura Wix: ${w.fakturyWix.map(idOf).join(', ')}.`];
   if (o.status !== 'APPROVED') return [K.DO_SPRAWDZENIA, `Status zamówienia ${o.status}.`];
   if (o.razem === 0) return [K.ZEROWE, 'Wartość 0 zł.'];
   if (w.transakcje === null) return [K.DO_SPRAWDZENIA, 'Nie odczytano transakcji zamówienia.'];

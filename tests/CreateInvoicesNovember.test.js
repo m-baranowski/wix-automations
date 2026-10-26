@@ -1007,3 +1007,18 @@ test('REVIEW: next order must be read again before create in same batch', async(
  await run(env,{maxFaktur:2,etap:'UTWORZ'});
  assert.equal(env.inv.utworzenia,1,'Created invoice for an order that changed to PAID during batch');
 });
+
+test('faktura do zamówienia — pomijane zawsze, także przy rozbieżnościach i anulowaniu', async () => {
+  const w = swiat([{ contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [
+    { umowaId: 'u1', fakturyWix: [{ id: 'f1' }], externalOrderId: 'OBCY' },
+    { umowaId: 'u2', fakturyWix: [{ id: 'f2' }], status: 'CANCELED' },
+    { umowaId: 'u3', fakturyWix: [{ id: 'f3' }], paymentStatus: 'PARTIALLY_PAID', zaplacono: 100 },
+    { umowaId: 'u4' }] }]);
+  const env = srodowisko(w);
+  const p = await env.proces.podglad();
+  for (const id of ['ord-u1', 'ord-u2', 'ord-u3']) assert.equal(kat(p, id), K.ROZLICZONE, id);
+  assert.deepEqual(p.proponowaneFaktury[0].orderIds, ['ord-u4']);
+  await wykonajWszystko(env);
+  assert.equal(env.inv.utworzenia, 1);
+  assert.equal(faktury(env)[0].totals.total, 640);
+});
