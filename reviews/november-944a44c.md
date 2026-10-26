@@ -57,10 +57,32 @@ Zachować identyfikatory R1–R4. Dopisać niżej dla każdego: decyzję, commit
 
 | ID | Odpowiedź agenta | Commit | Test/dowód |
 | --- | --- | --- | --- |
-| R1 | oczekuje | | |
-| R2 | oczekuje | | |
-| R3 | oczekuje | | |
-| R4 | oczekuje | | |
+| R1 | Przyjęte, z odstępstwem opisanym niżej. APPROVE wymaga `audytFaktur { sprawdzono, kto, zakres }`; audyt zapisany w każdej operacji z miesiącem, contactId, orderIds, fingerprintem i zaakceptowanymi brakami. RUN sprawdza audyt (`problemyAudytu`); brak lub nieaktualny → `NEEDS_REVIEW / BRAK_AUDYTU`, bez `createInvoice`. Wpisy `FakturyMiesieczne` za miesiąc bez `rodzaj` FAKTURA/ZAMOWIENIE → klient `DO_SPRAWDZENIA`; wpis bez kontaktu → brak kompletności. | fd3ded1 | testy `R1:` (6): standalone poza dziennikiem / APPROVE bez audytu, audyt trwały, audyt nieaktualny, brak audytu, wpis legacy z kontaktem, wpis legacy bez kontaktu |
+| R2 | Przyjęte. `sprawdzFakture` porównuje każdą pozycję (znormalizowana nazwa, ilość, cena w groszach), rabat faktury (wartość i typ Fixed), walutę PLN (wymagana), `metadata.sourceRefId` (wymagany) i sumę. Jedyny jawny wyjątek: brak `sourceRefId` przy `FAKTURA_ISTNIEJE` z `potwierdzam: true` — pozostałe pola nadal muszą się zgadzać; inny `sourceRefId` nigdy. | fd3ded1 | regresja recenzenta 1/1 PASS; testy `R2:` (6) w tym rabat zmieniony przy tej samej sumie, faktura zmieniona przed wysyłką, odmowa przypięcia ręcznej faktury o tej samej kwocie |
+| R3 | Przyjęte. `groszeWymagane` dla ceny pozycji, `subtotal`, `total`; zamówienie bez pozycji = błąd. Brak kwoty → zamówienie nieczytelne, kwota `NIEZNANA`, `DO_SPRAWDZENIA`, licznik `nieznanychKwot`. `parsujGrosze`: tylko liczba lub dziesiętny tekst, `Number.isSafeInteger`, max 2 miejsca. Pola opcjonalne (rabat, podatek, wysyłka, opłaty, saldo) nadal 0 przy braku. | fd3ded1 | regresja recenzenta 2/2 PASS; testy `R3:` (3) |
+| R4 | Przyjęte. Sumy liczą każde `orderId` raz. Osobno `arytmetykaOk` i `kompletne` (`kompletnosc`: nieodczytane, bez kwoty, zdublowane orderId, cykle bez zamówień, wpisy dziennika bez kontaktu); `kontroleOk = arytmetykaOk && kompletne`. PREPARE i APPROVE odmawiają przy brakach, chyba że `akceptujNiekompletne` wymienia dokładnie te ID (zapisywane w audycie). | fd3ded1 | testy `R4:` (2) oraz `R3:` proces; pełny zestaw `npm test`: 62/62 PASS |
+
+### Odstępstwo w R1
+
+Recenzent proponuje „brak dowodu → DO_SPRAWDZENIA” już w klasyfikacji. Zostawiłem kategorię `DO_FAKTURY` w PREVIEW, a bramkę umieściłem w APPROVE (audyt) i RUN (weryfikacja audytu przed `createInvoice`). Powód: dowód braku faktury samodzielnej może pochodzić tylko od człowieka (API go nie daje), więc oznaczenie wszystkich zamówień jako `DO_SPRAWDZENIA` uniemożliwiłoby policzenie, co ma zostać zatwierdzone. Efekt bezpieczeństwa jest ten sam: żadna faktura nie powstaje bez trwałego, aktualnego audytu dla konkretnych orderIds, kontaktu, miesiąca i fingerprintu.
+
+Nie dodano zapytania do nowego API Get Paid (`@wix/get-paid` queryInvoices): dokumentacja podaje, że nie jest dostępne dla wszystkich witryn (błąd 428 przed migracją), a jego dostępności dla centrumtoto.pl nie potwierdzono.
+
+### Weryfikacja integracji — stan
+
+Źródła dokumentacji, na których oparto kontrakty (odczyt przez narzędzia dokumentacji Wix, 2026-10-26):
+
+- `createInvoice` (wix-billing-backend): https://dev.wix.com/docs/velo/api-reference/wix-billing-backend/invoices/create-invoice — odpowiedź `{ id: { id, version } }`, pola `customer`, `lineItems`, `discount { value, type: "Fixed" }`, `dates`, `metadata.sourceRefId`.
+- `sendInvoice(id: IdAndVersion, emailInfo)`: https://dev.wix.com/docs/velo/api-reference/wix-billing-backend/invoices/send-invoice
+- `getInvoice(id)`: https://dev.wix.com/docs/velo/api-reference/wix-billing-backend/invoices/get-invoice — przykład zawiera `status`, `currency`, `lineItems`, `discount`, `totals`, `metadata`, `wasSent`.
+- Order Invoices `listInvoicesForMultipleOrders`: https://dev.wix.com/docs/api-reference/business-solutions/e-commerce/orders/order-invoices/list-invoices-for-multiple-orders
+- Order Transactions `listTransactionsForMultipleOrders`: https://dev.wix.com/docs/api-reference/business-solutions/e-commerce/orders/order-transactions/list-transactions-for-multiple-orders
+- Orders `searchOrders` / `getOrder` (filtry `id`, `channelInfo.externalOrderId` z `$in`; `appliedDiscounts`, `balanceSummary`, `paymentStatus`): https://dev.wix.com/docs/api-reference/business-solutions/e-commerce/orders/orders/get-order
+- Get Paid Invoices (428 przed migracją; STANDALONE tworzy nowe zamówienie po płatności): https://dev.wix.com/docs/api-reference/business-management/get-paid/invoices/invoices/introduction
+
+Niepotwierdzone i nadal blokujące produkcyjny RUN do osobnej decyzji administratora: akceptacja ujemnej ceny pozycji przez `createInvoice`, obecność `metadata` i `currency` w rzeczywistej odpowiedzi `getInvoice`, zanonimizowane przykłady rzeczywistych odpowiedzi. Agent nie wykonywał wywołań API na witrynie.
+
+Ponowny przegląd: oczekuje.
 
 Uruchomienie regresji po dodaniu pliku na ocenianą gałąź:
 `node --import ./tests/wix-stub.mjs --test reviews/november-944a44c.regression.mjs`
