@@ -33,7 +33,7 @@
  *
  * DZIENNIK FakturyMiesieczne (wiersze październikowe bez zmian)
  *  Dodaj w CMS pola: rodzaj, operationId, orderId, email, numeryZamowien,
- *  kwotaGrosze, rabatFaktury, fingerprint, utworzenieRozpoczete, powod,
+ *  kwotaGrosze, fingerprint, utworzenieRozpoczete, powod,
  *  audyt, utworzono, wyslano (pozostałe pola już istnieją).
  *  rodzaj FAKTURA     _id = hash(miesiąc, contactId, posortowane orderIds)
  *  rodzaj ZAMOWIENIE  _id = hash(orderId), pole operationId. Wix odrzuca
@@ -41,25 +41,22 @@
  *  Statusy: PREPARED → APPROVED → CREATING → CREATED → SENDING → SENT,
  *           NEEDS_REVIEW, CANCELLED.
  *
- * KOLEJNOŚĆ PRACY — ustaw TRYB (i OPCJE_RUN), zapisz, odpal automatyzację.
- *  0. PROBE   — getInvoice ostatniej faktury z dziennika; log
- *               FAKTURY_PROBE ze strukturą (bez danych osobowych).
- *               Wymagane brakujaceDlaKontroli = [].
- *  1. PREVIEW — tylko odczyt. Logi: FAKTURY_PREVIEW_ZAMOWIENIE (tabela),
- *               _FAKTURA (proponowane faktury), _SUMY, _BRAKI,
- *               _DO_ZATWIERDZENIA (liczba i suma wszystkich faktur miesiąca).
- *  2. Sprawdź w panelu Faktury, że klienci z PREVIEW nie mają faktur
- *     za listopad wystawionych BEZ powiązania z zamówieniem (tylko takich
- *     API nie wykrywa; faktury do zamówień skrypt pomija sam).
- *  3. RUN, OPCJE_RUN: oczekiwanaLiczba i oczekiwanaSuma z PREVIEW,
- *     sprawdzilemPanelFaktur: true, kto: '<imię>', akceptujBraki: ID
- *     z FAKTURY_PREVIEW_BRAKI świadomie pominięte (zwykle []),
- *     maxFaktur: 1, etap: 'UTWORZ' → faktura próbna (najlepiej z rabatem);
- *     obejrzyj w panelu. Jeśli Wix odrzuci ujemną pozycję: RABAT_JAKO =
- *     'RABAT_FAKTURY' (operacja wpadnie w NEEDS_REVIEW — patrz niżej).
- *  4. RUN, etap 'WYSLIJ' → sprawdź e-mail i SMS.
- *  5. RUN, etap 'OBA', maxFaktur 2–5 → odpalaj do pozostalo = 0.
- *  6. STATUS i PREVIEW: doNowychFaktur = 0. Na koniec TRYB = 'PREVIEW'.
+ * JEDNO STANDARDOWE PRZEJŚCIE — jedna stała ZATWIERDZAM_SUME:
+ *  1. ZATWIERDZAM_SUME = '' → zapisz, odpal automatyzację. To PREVIEW
+ *     (tylko odczyt). Logi: FAKTURY_PREVIEW_ZAMOWIENIE (tabela),
+ *     _FAKTURA (proponowane faktury), _SUMY, _BRAKI, _DZIENNIK (statusy),
+ *     _PROBE (struktura ostatniej faktury: brakujaceDlaKontroli = []),
+ *     _DO_ZATWIERDZENIA (liczba i suma wszystkich faktur miesiąca).
+ *  2. Przejrzyj doRecznejDecyzji i sumy. Wpisz sumę z _DO_ZATWIERDZENIA
+ *     do ZATWIERDZAM_SUME, zapisz i odpalaj automatyzację, aż log
+ *     FAKTURY_RUN pokaże pozostaloDoUtworzenia = 0 i pozostaloDoWyslania = 0.
+ *     Każde odpalenie tworzy i wysyła do 3 faktur. Suma jest stała między
+ *     odpaleniami; gdy dane się zmienią, RUN odmówi — wróć do kroku 1.
+ *  3. ZATWIERDZAM_SUME = '' i odpal: doNowychFaktur = 0. Wyłącz automatyzację.
+ *  Faktury do zamówień (Order Invoices) są pomijane automatycznie. Według
+ *  właściciela (2026-10-26) faktur listopadowych bez zamówienia nie ma.
+ *  Jeśli Wix odrzuci ujemną pozycję rabatu, pierwsza faktura z rabatem
+ *  przejdzie do NEEDS_REVIEW i RUN się zatrzyma — wymaga zmiany kodu.
  *  RUN przed każdą fakturą ponownie odczytuje zamówienia. Operacja, której
  *  zamówienia się zmieniły, a faktura nie powstała, jest anulowana
  *  automatycznie (wróci w kolejnym PREVIEW z nową kwotą).
@@ -120,26 +117,9 @@ import { createHash, randomBytes } from 'crypto';
 // URUCHOMIENIE
 // ======================================================
 
-// PROBE | PREVIEW | RUN | STATUS — PREVIEW niczego nie zapisuje.
-const TRYB = 'PREVIEW';
-
-const OPCJE_RUN = {
-  oczekiwanaLiczba: null,        // z FAKTURY_PREVIEW_DO_ZATWIERDZENIA
-  oczekiwanaSuma: '',            // np. '41280.00'
-  sprawdzilemPanelFaktur: false, // krok 2
-  kto: '',
-  akceptujBraki: [],             // ID z FAKTURY_PREVIEW_BRAKI
-  maxFaktur: 1,                  // 1–5
-  etap: 'UTWORZ',                // UTWORZ | WYSLIJ | OBA
-  contactIds: []                 // puste = wszyscy
-};
-
-// Pusty = ostatnia faktura z dziennika.
-const PROBE_INVOICE_ID = '';
-
-// 'POZYCJA' — każdy rabat jako ujemna pozycja (preferowane w Toto).
-// 'RABAT_FAKTURY' — suma rabatów jako rabat kwotowy faktury (zapasowo).
-const RABAT_JAKO = 'POZYCJA';
+// Puste — PREVIEW (tylko odczyt). Suma z FAKTURY_PREVIEW_DO_ZATWIERDZENIA
+// — każde odpalenie tworzy i wysyła kolejną partię faktur.
+const ZATWIERDZAM_SUME = '';
 
 const CFG = {
   miesiac: '2026-11',
@@ -147,7 +127,7 @@ const CFG = {
   temat: 'Rachunek za listopad — Centrum Terapii Dziecięcej Toto',
   tresc: 'Przesyłamy rachunek za listopad 2026. Dziękujemy!',
   dniNaPlatnosc: 5,
-  rabatJako: RABAT_JAKO,
+  partia: 3,
   appIdRezerwacji: '13d21c63-b5ec-5912-8397-c3a5ddb27a97',
   umowy: 'Umowy',
   cykle: 'UmowyMiesiace',
@@ -505,18 +485,15 @@ function zbudujPlan(contactId, zamowienia) {
       const klucz = `${o.orderId}/${r.discountId}`;
       if (rabaty.some(x => x.klucz === klucz)) throw new Error(`Rabat ${klucz} dwukrotnie.`);
       rabaty.push({ klucz, kwota: r.kwota, opis: r.opis });
-      if (CFG.rabatJako === 'POZYCJA') {
-        pozycje.push({ nazwa: 'Rabat', opis: `${r.opis} — zamówienie ${nr}`, cena: -r.kwota, ilosc: 1 });
-      }
+      pozycje.push({ nazwa: 'Rabat', opis: `${r.opis} — zamówienie ${nr}`, cena: -r.kwota, ilosc: 1 });
     }
   }
 
   const razem = suma(kolejne, o => o.razem);
   const sumaRabatow = suma(rabaty, r => r.kwota);
-  const rabatFaktury = CFG.rabatJako === 'RABAT_FAKTURY' ? sumaRabatow : 0;
 
   if (sumaRabatow !== suma(kolejne, o => o.rabat)) throw new Error('Rabaty faktury ≠ rabaty zamówień.');
-  if (suma(pozycje, p => p.cena * p.ilosc) - rabatFaktury !== razem) throw new Error('Pozycje faktury ≠ wartość zamówień.');
+  if (suma(pozycje, p => p.cena * p.ilosc) !== razem) throw new Error('Pozycje faktury ≠ wartość zamówień.');
   if (razem <= 0) throw new Error('Faktura ≤ 0 zł.');
 
   const orderIds = [...ids].sort();
@@ -526,7 +503,6 @@ function zbudujPlan(contactId, zamowienia) {
     orderIds,
     numery: kolejne.map(o => o.numer),
     pozycje,
-    rabatFaktury,
     brutto: suma(kolejne, o => o.brutto),
     rabaty: sumaRabatow,
     razem
@@ -535,7 +511,6 @@ function zbudujPlan(contactId, zamowienia) {
   plan.fingerprint = hash({
     orderIds,
     pozycje,
-    rabatFaktury,
     zamowienia: kolejne.map(o => [o.orderId, o.razem, o.rabat, o.paymentStatus])
   });
 
@@ -597,7 +572,6 @@ function polaFaktury(plan, k, teraz) {
     }
   };
 
-  if (plan.rabatFaktury) pola.discount = { value: plan.rabatFaktury / 100, type: 'Fixed' };
   return pola;
 }
 
@@ -645,7 +619,7 @@ function sprawdzFakture(f, op) {
   }
 
   const rabat = pusta(f.discount?.value) ? 0 : kwota(f.discount.value, 'rabat faktury');
-  if (rabat !== null && rabat !== (op.rabatFaktury || 0)) p.push(`Rabat faktury ${zl(rabat)} ≠ ${zl(op.rabatFaktury || 0)}.`);
+  if (rabat) p.push(`Faktura ma rabat kwotowy ${zl(rabat)} — rabaty są pozycjami.`);
 
   return p;
 }
@@ -807,7 +781,7 @@ function kwotaDoSum(w) {
  * Sumy kontrolne. arytmetykaOk: należności nie znikają między kategoriami.
  * braki: kompletność źródeł (nieodczytane / bez kwoty / zdublowane
  * zamówienia, cykle bez zamówień, wpisy dziennika bez kontaktu) — RUN
- * wymaga, by administrator wymienił je dokładnie w akceptujBraki.
+ * ich nie fakturuje (trafiają do ręcznej decyzji) i raportuje w braki.
  */
 function policzSumy(zamowienia, plany, cykleBezZamowien, wpisyBezKontaktu) {
   const widziane = new Set();
@@ -942,7 +916,6 @@ function createJournal(db, opts = {}) {
         kwota: plan.razem / 100,
         kwotaGrosze: plan.razem,
         pozycje: plan.pozycje,
-        rabatFaktury: plan.rabatFaktury,
         fingerprint: plan.fingerprint,
         utworzenieRozpoczete: false,
         audyt,
@@ -958,7 +931,6 @@ function createJournal(db, opts = {}) {
         kwota: plan.razem / 100,
         kwotaGrosze: plan.razem,
         pozycje: plan.pozycje,
-        rabatFaktury: plan.rabatFaktury,
         fingerprint: plan.fingerprint,
         audyt,
         powod: '',
@@ -1260,7 +1232,6 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
         email: kontakty[i].k?.email || '',
         orderIds: p.orderIds,
         pozycje: p.pozycje.map(x => ({ nazwa: x.nazwa, opis: x.opis, cena: zl(x.cena), ilosc: x.ilosc })),
-        rabatFaktury: zl(p.rabatFaktury),
         razem: zl(p.razem),
         problemyKontaktu: kontakty[i].problemy
       })),
@@ -1270,10 +1241,23 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
         .map(w => ({ klient: w.klient, orderId: w.row.orderId, powod: w.powod }))
     };
 
+    // Statusy dziennika i struktura ostatniej faktury (dawniej STATUS i PROBE).
+    const ops = [...stan.operacje.values()];
+    wynik.dziennik = Object.fromEntries([...new Set(ops.map(op => op.status))].map(st => [st, ops.filter(op => op.status === st).length]));
+    wynik.wymagajaDecyzji = ops.filter(op => op.status === S.NEEDS_REVIEW).map(op => ({ operationId: op._id, klient: op.klientNazwa, powod: op.powod, blad: op.blad }));
+    try {
+      const ostatnia = await journal.ostatniaFaktura();
+      wynik.probe = ostatnia ? strukturaFaktury(await gateway.pobierzFakture(ostatnia.invoiceId)) : 'brak faktur w dzienniku';
+    } catch (e) {
+      wynik.probe = `getInvoice: ${msg(e)}`;
+    }
+
     wynik.tabela.forEach(x => log.log('FAKTURY_PREVIEW_ZAMOWIENIE', JSON.stringify(x)));
     wynik.proponowaneFaktury.forEach(x => log.log('FAKTURY_PREVIEW_FAKTURA', JSON.stringify(x)));
     log.log('FAKTURY_PREVIEW_SUMY', JSON.stringify({ ...wynik.sumy, kontrole: wynik.kontrole }));
     log.log('FAKTURY_PREVIEW_BRAKI', JSON.stringify(wynik.braki));
+    log.log('FAKTURY_PREVIEW_DZIENNIK', JSON.stringify({ statusy: wynik.dziennik, wymagajaDecyzji: wynik.wymagajaDecyzji }));
+    log.log('FAKTURY_PREVIEW_PROBE', JSON.stringify(wynik.probe));
     log.log('FAKTURY_PREVIEW_DO_ZATWIERDZENIA', JSON.stringify(wynik.doZatwierdzenia));
 
     return wynik;
@@ -1386,25 +1370,22 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
     return { op: await journal.zmien(op, [S.SENDING], { status: S.SENT, wyslano: now().toISOString(), blad: '' }) };
   }
 
+  // RUN rusza tylko przy pełnych odczytach, zgodnej arytmetyce i sumie
+  // równej bieżącemu PREVIEW. Braki kompletności nie blokują — te
+  // zamówienia i tak nie są fakturowane (trafiają do ręcznej decyzji).
   function bramka(a, o) {
     if (a.bledyGlobalne.length) return a.bledyGlobalne.join(' ');
-    if (!a.sumy.arytmetykaOk) return 'Kontrole sum nie przeszły — uruchom PREVIEW.';
-    if ([...new Set(o.akceptujBraki || [])].sort().join(',') !== a.sumy.braki.join(',')) {
-      return `Braki kompletności: [${a.sumy.braki.join(', ')}] — rozstrzygnij albo wpisz je dokładnie w akceptujBraki.`;
-    }
-    if (o.sprawdzilemPanelFaktur !== true || !String(o.kto || '').trim()) {
-      return 'Potwierdź sprawdzenie panelu Faktury (sprawdzilemPanelFaktur: true, kto).';
-    }
-    if (o.oczekiwanaLiczba !== a.doZatwierdzenia.liczba || pusta(o.oczekiwanaSuma) || grosze(o.oczekiwanaSuma) !== grosze(a.doZatwierdzenia.suma)) {
-      return `Liczba/suma ≠ PREVIEW (teraz: ${a.doZatwierdzenia.liczba} faktur, ${a.doZatwierdzenia.suma} zł).`;
+    if (!a.sumy.arytmetykaOk) return 'Kontrole sum nie przeszły — zobacz PREVIEW.';
+    if (pusta(o.oczekiwanaSuma) || grosze(o.oczekiwanaSuma) !== grosze(a.doZatwierdzenia.suma)) {
+      return `ZATWIERDZAM_SUME ≠ PREVIEW (teraz: ${a.doZatwierdzenia.liczba} faktur, ${a.doZatwierdzenia.suma} zł).`;
     }
     return null;
   }
 
   async function wykonaj(o = {}) {
-    const etap = o.etap || 'UTWORZ';
-    if (!['UTWORZ', 'WYSLIJ', 'OBA'].includes(etap)) throw new Error('etap: UTWORZ | WYSLIJ | OBA');
-    const limit = Math.min(Math.max(Number(o.maxFaktur) || 1, 1), 5);
+    // etap i maxFaktur są wewnętrzne (testy); standard: tworzenie + wysyłka.
+    const etap = o.etap || 'OBA';
+    const limit = o.maxFaktur || CFG.partia;
     const koniec = Date.now() + CFG.maxSekund * 1000;
     const czas = () => koniec - Date.now() > CFG.zapasMs;
 
@@ -1423,17 +1404,16 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
       const odmowa = bramka(a, o);
       if (odmowa) return { tryb: 'RUN', status: 'ODMOWA', blad: odmowa, uporzadkowane: uporzadkowane.map(x => x._id) };
 
-      const wybrany = c => !o.contactIds?.length || o.contactIds.includes(c);
-      const operacje = [...(await journal.wiersze()).operacje.values()].filter(op => wybrany(op.klientContactId));
-      // Audyt: kto potwierdził panel Faktury, kiedy, jakie braki świadomie
-      // pominięto. Zapisywany w operacji przy tworzeniu faktury.
-      const audyt = { kto: String(o.kto).trim(), data: now().toISOString(), akceptowaneBraki: a.sumy.braki };
+      const operacje = [...(await journal.wiersze()).operacje.values()];
+      // Audyt: zatwierdzona suma, data i braki widoczne przy zatwierdzeniu.
+      // Zapisywany w operacji przy tworzeniu faktury.
+      const audyt = { zatwierdzonaSuma: a.doZatwierdzenia.suma, data: now().toISOString(), braki: a.sumy.braki };
 
       const kolejka = [
         ...(etap === 'UTWORZ' ? [] : operacje.filter(op => op.status === S.CREATED)),
         ...(etap === 'WYSLIJ' ? [] : [
           ...operacje.filter(op => [S.PREPARED, S.APPROVED].includes(op.status)),
-          ...a.plany.filter(p => wybrany(p.contactId) && !aktywna(operacje, p.operationId))
+          ...a.plany.filter(p => !aktywna(operacje, p.operationId))
         ])
       ].slice(0, limit);
 
@@ -1504,28 +1484,7 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
     }
   }
 
-  // ---------------- STATUS / PROBE ----------------
-
-  async function status() {
-    const ops = [...(await journal.wiersze()).operacje.values()];
-    const statusy = {};
-    ops.forEach(op => { statusy[op.status] = (statusy[op.status] || 0) + 1; });
-    return {
-      tryb: 'STATUS',
-      statusy,
-      operacje: ops.map(op => ({ operationId: op._id, klient: op.klientNazwa, status: op.status, kwota: zl(op.kwotaGrosze || 0), invoiceId: op.invoiceId, orderIds: op.orderIds, powod: op.powod || '', blad: op.blad || '' }))
-    };
-  }
-
-  async function sonda(invoiceId = '') {
-    const zrodlo = invoiceId ? 'PROBE_INVOICE_ID' : await journal.ostatniaFaktura();
-    const id = invoiceId || zrodlo?.invoiceId;
-    if (!id) return { tryb: 'PROBE', status: 'ODMOWA', blad: 'Brak invoiceId.' };
-    const f = await gateway.pobierzFakture(id);
-    return { tryb: 'PROBE', status: 'OK', zrodlo: invoiceId ? 'PROBE_INVOICE_ID' : `dziennik ${zrodlo.miesiac}`, ...strukturaFaktury(f) };
-  }
-
-  return { podglad, wykonaj, status, sonda };
+  return { podglad, wykonaj };
 }
 
 // ======================================================
@@ -1538,13 +1497,13 @@ function zaloguj(wynik) {
   for (const [k, v] of Object.entries(wynik || {})) {
     if (['tabela', 'proponowaneFaktury'].includes(k)) continue; // PREVIEW loguje sam
     if (Array.isArray(v) && v.length && typeof v[0] === 'object') {
-      v.forEach(x => console.log(`FAKTURY_${TRYB}_${k}`, JSON.stringify(x)));
+      v.forEach(x => console.log(`FAKTURY_${wynik.tryb}_${k}`, JSON.stringify(x)));
       reszta[k] = v.length;
     } else {
       reszta[k] = v;
     }
   }
-  console.log(`FAKTURY_${TRYB}`, JSON.stringify(reszta));
+  console.log(`FAKTURY_${wynik.tryb}`, JSON.stringify(reszta));
 }
 
 export const invoke = async () => {
@@ -1552,16 +1511,9 @@ export const invoke = async () => {
   const p = createProcess({ gateway, journal: createJournal(gateway.db) });
 
   try {
-    const wynik =
-      TRYB === 'PREVIEW' ? await p.podglad()
-        : TRYB === 'RUN' ? await p.wykonaj(OPCJE_RUN)
-          : TRYB === 'STATUS' ? await p.status()
-            : TRYB === 'PROBE' ? await p.sonda(PROBE_INVOICE_ID)
-              : null;
-    if (!wynik) throw new Error(`Nieznany TRYB: ${TRYB}`);
-    zaloguj(wynik);
+    zaloguj(ZATWIERDZAM_SUME ? await p.wykonaj({ oczekiwanaSuma: ZATWIERDZAM_SUME }) : await p.podglad());
   } catch (e) {
-    console.error('FAKTURY_BLAD', TRYB, e?.name || '', msg(e));
+    console.error('FAKTURY_BLAD', e?.name || '', msg(e));
     throw e;
   }
 

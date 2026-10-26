@@ -353,16 +353,7 @@ function srodowisko(spec) {
 // Opcje RUN zgodne z bieżącym PREVIEW (jak administrator).
 async function opcjeZPodgladu(env, extra = {}) {
   const p = await env.proces.podglad();
-  return {
-    oczekiwanaLiczba: p.doZatwierdzenia.liczba,
-    oczekiwanaSuma: p.doZatwierdzenia.suma,
-    sprawdzilemPanelFaktur: true,
-    kto: 'Administrator testowy',
-    akceptujBraki: p.braki,
-    maxFaktur: 5,
-    etap: 'OBA',
-    ...extra
-  };
+  return { oczekiwanaSuma: p.doZatwierdzenia.suma, maxFaktur: 5, ...extra };
 }
 
 async function run(env, extra = {}) {
@@ -491,7 +482,7 @@ test('klucze zamówień z witryny: znane formaty tak, obce nie', () => {
 
 // R2: kontrola treści faktury przed wysyłką
 const opPlan = {
-  _id: 'op', invoiceId: 'i', klientContactId: 'c', kwotaGrosze: 48000, rabatFaktury: 0,
+  _id: 'op', invoiceId: 'i', klientContactId: 'c', kwotaGrosze: 48000,
   pozycje: [{ nazwa: 'Terapia logopedyczna', cena: 16000, ilosc: 4 }, { nazwa: 'Rabat', cena: -16000, ilosc: 1 }]
 };
 const fakturaZgodna = () => ({
@@ -658,7 +649,7 @@ test('12. ponowny RUN po utworzeniu części faktur', async () => {
   await wykonajWszystko(env);
   assert.equal(env.inv.utworzenia, 3);
   assert.equal(env.inv.wysylki, 3);
-  assert.deepEqual((await env.proces.status()).statusy, { SENT: 3 });
+  assert.deepEqual((await env.proces.podglad()).dziennik, { SENT: 3 });
 });
 
 test('13. awaria po createInvoice() — bez drugiej faktury, ręczne przypięcie', async () => {
@@ -792,24 +783,18 @@ test('PREVIEW nie zapisuje niczego i nie tworzy faktur', async () => {
   assert.equal(env.inv.utworzenia, 0);
 });
 
-test('R1/bramka: RUN wymaga zgodnej liczby, sumy i potwierdzenia panelu Faktury', async () => {
+test('bramka: RUN wymaga sumy równej bieżącemu PREVIEW; audyt w operacji', async () => {
   const env = jedenKlient();
   const ok = await opcjeZPodgladu(env);
-  for (const zle of [
-    { oczekiwanaSuma: '600.00' },
-    { oczekiwanaLiczba: 2 },
-    { sprawdzilemPanelFaktur: false },
-    { kto: ' ' }
-  ]) {
-    const r = await env.proces.wykonaj({ ...ok, ...zle });
-    assert.equal(r.status, 'ODMOWA', JSON.stringify(zle));
+  for (const zle of [{ oczekiwanaSuma: '600.00' }, { oczekiwanaSuma: '' }]) {
+    assert.equal((await env.proces.wykonaj({ ...ok, ...zle })).status, 'ODMOWA');
   }
   assert.equal(env.inv.utworzenia, 0);
   assert.equal(operacje(env).length, 0);
   await env.proces.wykonaj(ok);
-  assert.equal(operacje(env)[0].audyt.kto, 'Administrator testowy');
+  assert.equal(operacje(env)[0].audyt.zatwierdzonaSuma, '640.00');
+  assert.ok(operacje(env)[0].audyt.fingerprint);
 });
-
 test('R1: wpis dziennika za listopad spoza modelu — klient do sprawdzenia; bez kontaktu — brak', async () => {
   const env = jedenKlient();
   await env.db.insert(CFG.dziennik, { _id: 'legacy-1', miesiac: MIESIAC, klientContactId: ANNA, status: 'WYSLANA' });
@@ -822,8 +807,7 @@ test('R1: wpis dziennika za listopad spoza modelu — klient do sprawdzenia; bez
   const p2 = await env2.proces.podglad();
   assert.deepEqual(p2.braki, ['legacy-2']);
   assert.equal(p2.kontroleOk, false);
-  assert.equal((await run(env2, { akceptujBraki: [] })).status, 'ODMOWA');
-  assert.equal((await run(env2)).status, 'OK');
+  assert.equal((await run(env2)).status, 'OK', 'braki raportowane, nie blokują');
 });
 
 test('R4: duplikat orderId liczony raz, cykl bez zamówienia, nieznana kwota — braki wymagają akceptacji', async () => {
@@ -840,7 +824,6 @@ test('R4: duplikat orderId liczony raz, cykl bez zamówienia, nieznana kwota —
   assert.equal(p.tabela.find(x => x.orderId === 'ord-u3').netto, 'NIEZNANA');
   assert.equal(p.arytmetykaOk, true);
   assert.equal(p.kontroleOk, false);
-  assert.equal((await run(env, { akceptujBraki: ['ord-u3'] })).status, 'ODMOWA');
 
   await wykonajWszystko(env);
   assert.equal(env.inv.utworzenia, 1, 'tylko jasne zamówienie u4');
@@ -864,7 +847,7 @@ test('zmiana zamówienia po zaplanowaniu — operacja anulowana przed createInvo
   z.paymentStatus = 'PAID';
   z.balanceSummary.paid = { amount: '640.00' };
 
-  const r = await env.proces.wykonaj({ ...o, akceptujBraki: [] });
+  const r = await env.proces.wykonaj(o);
   assert.equal(r.wyniki[0].status, S.CANCELLED);
   assert.equal(env.inv.utworzenia, 0);
   assert.equal(kat(await env.proces.podglad(), 'ord-u1'), K.DO_SPRAWDZENIA);
@@ -901,22 +884,6 @@ test('R2: faktura zmieniona między utworzeniem a wysyłką — bez wysyłki', a
   const r = await run(env, { etap: 'WYSLIJ' });
   assert.equal(r.wyniki[0].powod, 'INVOICE_MISMATCH');
   assert.equal(env.inv.wysylki, 0);
-});
-
-test('tryb RABAT_FAKTURY — rabat kwotowy zamiast ujemnych pozycji', async () => {
-  CFG.rabatJako = 'RABAT_FAKTURY';
-  try {
-    const env = jedenKlient([{ umowaId: 'u1', rabaty: [{ kwota: 160 }] }, { umowaId: 'u2', cena: 180, rabaty: [{ kwota: 180 }] }]);
-    env.inv.odrzucUjemne = true;
-    await wykonajWszystko(env);
-    const [f] = faktury(env);
-    assert.equal(f.lineItems.length, 2);
-    assert.deepEqual(f.discount, { value: 340, type: 'Fixed' });
-    assert.equal(f.totals.total, 1020);
-    assert.equal(env.inv.wysylki, 1);
-  } finally {
-    CFG.rabatJako = 'POZYCJA';
-  }
 });
 
 test('Wix odrzuca ujemne pozycje — NEEDS_REVIEW i zatrzymanie', async () => {
@@ -971,17 +938,16 @@ test('dane: PAID na 0 zł (stawka 0) — ZEROWE', async () => {
   assert.equal(kat(await jedenKlient([{ umowaId: 'u1', cena: 0, paymentStatus: 'PAID' }]).proces.podglad(), 'ord-u1'), K.ZEROWE);
 });
 
-test('PROBE w procesie: ostatnia faktura z dziennika, bez zapisów i danych osobowych', async () => {
+test('PREVIEW zawiera PROBE i statusy dziennika, bez zapisów i danych osobowych', async () => {
   const env = jedenKlient();
   await wykonajWszystko(env);
   const przed = env.db.zapisy;
-  const r = await env.proces.sonda();
-  assert.equal(r.status, 'OK');
-  assert.deepEqual(r.brakujaceDlaKontroli, []);
-  assert.ok(!JSON.stringify(r).includes('a@x.pl'));
+  const p = await env.proces.podglad();
+  assert.deepEqual(p.probe.brakujaceDlaKontroli, []);
+  assert.deepEqual(p.dziennik, { SENT: 1 });
+  assert.ok(!JSON.stringify(p.probe).includes('a@x.pl'));
   assert.equal(env.db.zapisy, przed);
 });
-
 test('REVIEW: cancelled plan can be prepared again for unchanged order set', async()=>{
  const env=jedenKlient();
  env.db.awaria=(op,c,item)=>op==='update' && item.status===S.CREATING;
