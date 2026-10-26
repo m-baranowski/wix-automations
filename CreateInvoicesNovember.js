@@ -56,43 +56,55 @@
  *          NEEDS_REVIEW, CANCELLED, CLOSED_MANUALLY.
  *
  * ------------------------------------------------------------------
- * KOLEJNOŚĆ PRACY (uruchamiaj ręcznie z edytora Velo)
+ * URUCHAMIANIE — automatyzacja z akcją „Run Velo Code”
  * ------------------------------------------------------------------
- * 1. podgladFaktur()  — PREVIEW: tylko odczyt. Zwraca tabelę zamówień,
- *    proponowane faktury, sumy (brutto, rabaty, netto, już rozliczone,
- *    do nowych faktur, do sprawdzenia, anulowane, zerowe), kontrole sum
- *    i listę doRecznejDecyzji. Wymagane: kontroleOk = true,
- *    bledyGlobalne = [].
- * 2. przygotujFaktury() — zapis PREPARED + przypisania. Bez faktur.
- * 3. zatwierdzFaktury({ wszystkie: true, oczekiwanaLiczba: N,
- *    oczekiwanaSuma: '12345.00' }) — liczba i suma muszą zgadzać się
- *    z PREVIEW/PREPARE.
- * 4. wykonajFaktury({ maxOperacji: 1, etap: 'UTWORZ', operationIds: [id] })
- *    — faktura próbna (najlepiej klient z rabatem), obejrzyj w panelu.
- *    Jeżeli Wix odrzuci ujemną pozycję: trybRabatu = 'INVOICE_DISCOUNT',
- *    ANULUJ niezrealizowane operacje i ponów kroki 2–3.
- * 5. wykonajFaktury({ maxOperacji: 1, etap: 'WYSLIJ', operationIds: [id] })
- *    — sprawdź e-mail i SMS.
- * 6. wykonajFaktury({ maxOperacji: 2 }) — powtarzaj do
- *    pozostaloDoUtworzenia = 0 i pozostaloDoWyslania = 0.
- * 7. statusFaktur() i ponowny podgladFaktur(): doNowychFaktur = 0,
- *    netto bez zmian.
+ * Jak w październiku: ustaw TRYB i OPCJE w sekcji URUCHOMIENIE poniżej,
+ * zapisz plik, uruchom automatyzację (wyzwalacz testowy). Wynik jest
+ * w logach (Monitoring / Logi strony) z prefiksem FAKTURY_.
+ * Po każdej zmianie TRYBU zapisz plik przed wywołaniem automatyzacji.
+ * Ponowne lub podwójne odpalenie automatyzacji jest bezpieczne:
+ * równoległe wywołanie dostaje BUSY, a dziennik nie pozwala utworzyć
+ * ani wysłać tej samej faktury drugi raz.
+ *
+ * KOLEJNOŚĆ PRACY
+ * 1. TRYB 'PREVIEW' — tylko odczyt. Logi: FAKTURY_PREVIEW_ZAMOWIENIE
+ *    (tabela zamówień), FAKTURY_PREVIEW_FAKTURA (proponowane faktury),
+ *    FAKTURY_PREVIEW_SUMY (brutto, rabaty, netto, już rozliczone,
+ *    do nowych faktur, do sprawdzenia, anulowane, zerowe),
+ *    FAKTURY_PREVIEW_KONTROLE, FAKTURY_PREVIEW_doRecznejDecyzji.
+ *    Wymagane: kontroleOk = true, bledyGlobalne = [].
+ * 2. TRYB 'PREPARE' — zapis PREPARED + przypisania. Bez faktur.
+ *    Log FAKTURY_PREPARE podaje doZatwierdzenia: liczba i suma.
+ * 3. TRYB 'APPROVE' — wpisz w OPCJE.APPROVE oczekiwanaLiczba
+ *    i oczekiwanaSuma z PREVIEW/PREPARE; niezgodność = odmowa.
+ * 4. TRYB 'RUN', OPCJE.RUN = { maxOperacji: 1, etap: 'UTWORZ',
+ *    operationIds: ['<id>'] } — faktura próbna (najlepiej klient
+ *    z rabatem), obejrzyj w panelu Faktury. Jeżeli Wix odrzuci ujemną
+ *    pozycję: trybRabatu = 'INVOICE_DISCOUNT', RESOLVE 'ANULUJ'
+ *    niezrealizowane operacje i ponów kroki 2–3.
+ * 5. TRYB 'RUN', etap 'WYSLIJ', ten sam operationId — sprawdź e-mail i SMS.
+ * 6. TRYB 'RUN', OPCJE.RUN = { maxOperacji: 2, etap: 'OBA',
+ *    operationIds: [] } — odpalaj automatyzację, aż log FAKTURY_RUN
+ *    pokaże pozostaloDoUtworzenia = 0 i pozostaloDoWyslania = 0.
+ * 7. TRYB 'STATUS', potem 'PREVIEW': doNowychFaktur = 0, netto bez zmian.
+ * Na koniec ustaw TRYB = 'PREVIEW' (najbezpieczniejszy) albo usuń
+ * automatyzację.
  * RUN przed każdą fakturą ponownie czyta zamówienia; zmiana (opłata,
  * faktura, rabat, anulowanie) → NEEDS_REVIEW / ZMIANA_DANYCH, bez faktury.
  *
  * ------------------------------------------------------------------
  * WZNOWIENIE PO TIMEOUCIE
  * ------------------------------------------------------------------
- * - BUSY: inne wywołanie trwa — poczekaj.
- * - LOCK_REVIEW (blokada > 5 min): sprawdź logi, potem
- *   zwolnijBlokadeFaktur({ potwierdzam: true }).
- * - Ponowne wykonajFaktury(): CREATING → NEEDS_REVIEW/CREATE_UNCERTAIN
+ * - BUSY: inne wywołanie trwa — poczekaj i odpal ponownie.
+ * - LOCK_REVIEW (blokada > 5 min): sprawdź logi, potem TRYB 'UNLOCK'
+ *   z OPCJE.UNLOCK.potwierdzam = true.
+ * - Ponowny RUN: CREATING → NEEDS_REVIEW/CREATE_UNCERTAIN
  *   (bez ponownego tworzenia); SENDING → SENT, jeśli getInvoice().wasSent,
  *   inaczej NEEDS_REVIEW/SEND_UNCERTAIN; CREATED → wysyłka;
  *   APPROVED → utworzenie.
  *
  * ------------------------------------------------------------------
- * STANY NIEPEWNE — rozstrzygnijFakture({ operationId, decyzja, ... })
+ * STANY NIEPEWNE — TRYB 'RESOLVE', OPCJE.RESOLVE = { operationId, decyzja, ... }
  * ------------------------------------------------------------------
  *  CREATE_UNCERTAIN: szukaj w panelu Faktury (kontakt, „Listopad 2026”,
  *    kwota) i w logach FAKTURA_UTWORZONA.
@@ -140,6 +152,35 @@ import { elevate } from 'wix-auth';
 import { orders, orderInvoices, orderTransactions } from '@wix/ecom';
 import { auth } from '@wix/essentials';
 import { createHash, randomBytes } from 'crypto';
+
+// ##############################################################
+// URUCHOMIENIE — ustaw przed wywołaniem automatyzacji
+// ##############################################################
+
+// PREVIEW | PREPARE | APPROVE | RUN | STATUS | RESOLVE | UNLOCK
+// PREVIEW niczego nie zapisuje. Po pracy wróć do 'PREVIEW'.
+const TRYB = 'PREVIEW';
+
+const OPCJE = {
+  PREVIEW: {},
+
+  // Puste contactIds = wszyscy klienci z PREVIEW.
+  PREPARE: { contactIds: [] },
+
+  // Liczba i suma z logu FAKTURY_PREPARE (doZatwierdzenia).
+  APPROVE: { wszystkie: true, oczekiwanaLiczba: null, oczekiwanaSuma: '' },
+
+  // etap: 'UTWORZ' | 'WYSLIJ' | 'OBA'; puste operationIds = kolejne z dziennika.
+  RUN: { maxOperacji: 1, etap: 'UTWORZ', operationIds: [] },
+
+  STATUS: {},
+
+  // decyzja: FAKTURA_ISTNIEJE | FAKTURY_BRAK | WYSLANA | WYSLIJ_PONOWNIE |
+  //          ANULUJ | ZAMKNIJ_RECZNIE
+  RESOLVE: { operationId: '', decyzja: '', invoiceId: '', uwagi: '', potwierdzam: false },
+
+  UNLOCK: { potwierdzam: false }
+};
 
 // ##############################################################
 // KONFIGURACJA
@@ -3019,9 +3060,8 @@ function createProcess({ gateway, journal, cfg, now, log }) {
 }
 
 // ##############################################################
-// PUNKTY WEJŚCIA DLA ADMINISTRATORA
+// WYWOŁANIE Z AUTOMATYZACJI („Run Velo Code”)
 // ##############################################################
-
 
 function proces() {
   const cfg = KONFIGURACJA_LISTOPAD_2026;
@@ -3030,57 +3070,48 @@ function proces() {
   return createProcess({ gateway, journal, cfg });
 }
 
-/** PREVIEW: pobiera dane, łączy, liczy, wykrywa wyjątki. Nic nie zapisuje. */
-export function podgladFaktur(opcje = {}) {
-  return proces().podglad(opcje);
+async function wykonajTryb(p, tryb, opcje) {
+  switch (tryb) {
+    case 'PREVIEW': return p.podglad(opcje);
+    case 'PREPARE': return p.przygotuj(opcje);
+    case 'APPROVE': return p.zatwierdz(opcje);
+    case 'RUN': return p.wykonaj(opcje);
+    case 'STATUS': return p.status();
+    case 'RESOLVE': return p.rozstrzygnij(opcje);
+    case 'UNLOCK': return p.zwolnijBlokade(opcje);
+    default: throw new Error(`Nieznany TRYB: ${tryb}`);
+  }
 }
 
-/** PREPARE: zapisuje plan faktur (PREPARED) i przypisania zamówień. */
-export function przygotujFaktury(opcje = {}) {
-  return proces().przygotuj(opcje);
+// Logi Wix ucinają bardzo długie wpisy — tablice logujemy element po elemencie.
+function zalogujWynik(tryb, wynik) {
+  // PREVIEW loguje już tabelę zamówień i faktury.
+  const pomin = tryb === 'PREVIEW' ? ['tabela', 'proponowaneFaktury'] : [];
+  const reszta = {};
+
+  for (const [k, v] of Object.entries(wynik || {})) {
+    if (pomin.includes(k)) continue;
+
+    if (Array.isArray(v) && v.length && typeof v[0] === 'object') {
+      for (const x of v) console.log(`FAKTURY_${tryb}_${k}`, JSON.stringify(x));
+      reszta[k] = `${v.length} (osobne wpisy FAKTURY_${tryb}_${k})`;
+    } else {
+      reszta[k] = v;
+    }
+  }
+
+  console.log(`FAKTURY_${tryb}`, JSON.stringify(reszta));
 }
 
-/**
- * APPROVE: decyzja administratora.
- * @param {{wszystkie?: boolean, operationIds?: string[],
- *          oczekiwanaLiczba: number, oczekiwanaSuma: string}} opcje
- */
-export function zatwierdzFaktury(opcje = {}) {
-  return proces().zatwierdz(opcje);
-}
-
-/**
- * RUN: tworzy i wysyła wyłącznie zatwierdzone faktury, małymi partiami.
- * @param {{maxOperacji?: number, maxSekund?: number,
- *          etap?: 'OBA'|'UTWORZ'|'WYSLIJ', operationIds?: string[]}} opcje
- */
-export function wykonajFaktury(opcje = {}) {
-  return proces().wykonaj(opcje);
-}
-
-export function statusFaktur() {
-  return proces().status();
-}
-
-/**
- * Rozstrzygnięcie stanu NEEDS_REVIEW (decyzja administratora).
- * @param {{operationId: string, decyzja: string, invoiceId?: string,
- *          uwagi?: string, potwierdzam?: boolean}} opcje
- */
-export function rozstrzygnijFakture(opcje = {}) {
-  return proces().rozstrzygnij(opcje);
-}
-
-export function zwolnijBlokadeFaktur(opcje = {}) {
-  return proces().zwolnijBlokade(opcje);
-}
-
-// Akcja „Run Velo Code” w automatyzacji — wyłącznie PREVIEW.
-// RUN nie jest podpięty pod automatyzacje: powtórzenie wyzwalacza
-// nie może uruchomić wystawiania faktur.
 export const invoke = async () => {
-  const r = await podgladFaktur();
-  console.log('FAKTURY_PREVIEW_AUTOMATYZACJA', JSON.stringify(r.sumy));
+  try {
+    const wynik = await wykonajTryb(proces(), TRYB, OPCJE[TRYB] || {});
+    zalogujWynik(TRYB, wynik);
+  } catch (e) {
+    console.error('FAKTURY_BLAD', TRYB, e?.name || '', e?.message || String(e));
+    throw e;
+  }
+
   return {};
 };
 
