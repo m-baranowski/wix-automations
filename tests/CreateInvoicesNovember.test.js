@@ -981,3 +981,29 @@ test('PROBE w procesie: ostatnia faktura z dziennika, bez zapisów i danych osob
   assert.ok(!JSON.stringify(r).includes('a@x.pl'));
   assert.equal(env.db.zapisy, przed);
 });
+
+test('REVIEW: cancelled plan can be prepared again for unchanged order set', async()=>{
+ const env=jedenKlient();
+ env.db.awaria=(op,c,item)=>op==='update' && item.status===S.CREATING;
+ await assert.rejects(run(env)); env.db.awaria=null;
+ const z=env.w.orders.get('ord-u1');
+ z.appliedDiscounts=[{_id:'d',merchantDiscount:{amount:{amount:'160'}}}];
+ z.priceSummary.discount={amount:'160'};z.priceSummary.total={amount:'480'};z.balanceSummary.balance={amount:'480'};
+ await run(env);assert.equal(operacje(env)[0].status,S.CANCELLED);
+ assert.equal((await env.proces.podglad()).proponowaneFaktury.length,1);
+ await run(env);
+ assert.equal(env.inv.utworzenia,1,'New valid plan is silently excluded because CANCELLED operation has same ID');
+});
+test('REVIEW: next order must be read again before create in same batch', async()=>{
+ const env=srodowisko([
+ {contactId:ANNA,nazwa:'Anna Nowak',email:'a@x.pl',umowy:[{umowaId:'u1'}]},
+ {contactId:BEATA,nazwa:'Beata Kowal',email:'b@x.pl',umowy:[{umowaId:'u2'}]}]);
+ const original=env.gateway.utworzFakture;
+ env.gateway.utworzFakture=async p=>{
+ const result=await original(p);
+ const z=env.w.orders.get('ord-u2');z.paymentStatus='PAID';z.balanceSummary.paid={amount:'640'};
+ return result;
+ };
+ await run(env,{maxFaktur:2,etap:'UTWORZ'});
+ assert.equal(env.inv.utworzenia,1,'Created invoice for an order that changed to PAID during batch');
+});

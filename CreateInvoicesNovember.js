@@ -57,7 +57,7 @@
  *  4. RUN, etap 'WYSLIJ' → sprawdź e-mail i SMS.
  *  5. RUN, etap 'OBA', maxFaktur 2–5 → odpalaj do pozostalo = 0.
  *  6. STATUS i PREVIEW: doNowychFaktur = 0. Na koniec TRYB = 'PREVIEW'.
- *  RUN przed każdą fakturą ponownie sprawdza zamówienia. Operacja, której
+ *  RUN przed każdą fakturą ponownie odczytuje zamówienia. Operacja, której
  *  zamówienia się zmieniły, a faktura nie powstała, jest anulowana
  *  automatycznie (wróci w kolejnym PREVIEW z nową kwotą).
  *  Podwójne odpalenie automatyzacji: drugie wywołanie dostaje BUSY.
@@ -71,18 +71,28 @@
  *    NEEDS_REVIEW/SEND_UNCERTAIN (bez ponownej wysyłki).
  *
  * STANY NIEPEWNE — decyzja ręczna przez edycję wiersza FAKTURA w CMS
- *  CREATE_UNCERTAIN: szukaj w panelu Faktury (kontakt, „Listopad 2026”,
- *    kwota) i w logu FAKTURA_UTWORZONA.
+ *  Zasada: zmieniaj status tylko na podstawie zapisu po stronie Wix.
+ *  Niedoręczony e-mail/SMS albo pobieżne wyszukiwanie niczego nie dowodzą.
+ *  Gdy wynik jest niejednoznaczny — zostaw NEEDS_REVIEW.
+ *  CREATE_UNCERTAIN: log FAKTURA_UTWORZONA oraz panel Faktury (lista
+ *    wszystkich faktur kontaktu, w tym szkice, z dnia uruchomienia).
  *      faktura jest → wpisz invoiceId, status CREATED (RUN porówna treść
  *                     z planem przed wysyłką);
- *      faktury brak → status APPROVED (RUN utworzy ją ponownie).
- *  SEND_UNCERTAIN: panel, skrzynka klienta, SMS.
- *      wysłana → status SENT;  nie dotarła → status CREATED.
+ *      brak w logu I w pełnej liście faktur kontaktu → status APPROVED.
+ *  SEND_UNCERTAIN: w panelu status faktury (wysłana/szkic) oraz historia
+ *    uruchomień automatyzacji „Invoice Sent” dla tej faktury.
+ *      oznaczona jako wysłana lub automatyzacja uruchomiona → status SENT;
+ *      szkic i brak uruchomienia automatyzacji → status CREATED.
  *  INVOICE_MISMATCH / INVOICE_STATUS / KONTAKT: popraw ręcznie, potem
  *    status CREATED albo APPROVED; sprawa zamknięta poza skryptem → SENT
  *    z opisem w polu blad.
  *  Nie usuwaj wierszy CREATING ani przypisań ZAMOWIENIE. Nie wysyłaj
  *  ręcznie faktur CREATED (podwójny e-mail i SMS).
+ *
+ * AUDYT: operacja zapisuje w polu audyt, kto potwierdził sprawdzenie panelu
+ *  Faktury, kiedy, jakie braki pominięto i fingerprint zamówień — z RUN,
+ *  który utworzył fakturę. Potwierdzenie jest deklaracją dla całego
+ *  miesiąca, nie dowodem z API (API nie wykrywa faktur spoza dziennika).
  *
  * OGRANICZENIA API (potwierdzone 2026-10-26)
  *  - Witryna ma Wix Invoices V1: nowe API (@wix/get-paid) zwraca 428;
@@ -768,7 +778,7 @@ function analizuj(stan) {
   // Liczba i suma wszystkich faktur miesiąca (istniejące operacje + nowe
   // plany) — stała między kolejnymi RUN, dopóki dane się nie zmienią.
   const aktywne = [...stan.operacje.values()].filter(op => op.status !== S.CANCELLED);
-  const nowe = plany.filter(p => !aktywne.some(op => op._id === p.operationId));
+  const nowe = plany.filter(p => !aktywna(aktywne, p.operationId));
   const doZatwierdzenia = {
     liczba: aktywne.length + nowe.length,
     suma: zl(suma(aktywne, op => op.kwotaGrosze || 0) + suma(nowe, p => p.razem))
@@ -776,6 +786,10 @@ function analizuj(stan) {
 
   return { zamowienia, plany, cykleBezZamowien, sumy, doZatwierdzenia, ostrzezenia, bledyGlobalne: stan.bledyGlobalne };
 }
+
+// Anulowana operacja nie blokuje poprawionego planu z tym samym ID
+// (journal.przygotuj otwiera ją ponownie z nowymi kwotami).
+const aktywna = (operacje, id) => operacje.some(op => op._id === id && op.status !== S.CANCELLED);
 
 function kwotaDoSum(w) {
   if (w.zamowienie) return w.zamowienie.razem;
@@ -1297,7 +1311,7 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
     }
   }
 
-  async function utworz(op, lock) {
+  async function utworz(op, lock, audyt) {
     const { k, problemy } = await kontaktDla(op.klientContactId);
     if (problemy.length) return { op: await doPrzegladu(op, S.APPROVED, 'KONTAKT', problemy.join(' ')) };
 
@@ -1305,7 +1319,13 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
     const pola = polaFaktury(plan, k, now());
 
     // Trwały zapis PRZED createInvoice.
-    op = await journal.zmien(op, [S.APPROVED], { status: S.CREATING, utworzenieRozpoczete: true, email: k.email, blad: '' });
+    op = await journal.zmien(op, [S.APPROVED], {
+      status: S.CREATING,
+      utworzenieRozpoczete: true,
+      email: k.email,
+      audyt: { ...audyt, fingerprint: op.fingerprint },
+      blad: ''
+    });
     await lock.pilnuj();
 
     let wynik;
@@ -1399,13 +1419,15 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
 
       const wybrany = c => !o.contactIds?.length || o.contactIds.includes(c);
       const operacje = [...(await journal.wiersze()).operacje.values()].filter(op => wybrany(op.klientContactId));
-      const audyt = { kto: String(o.kto).trim(), data: now().toISOString() };
+      // Audyt: kto potwierdził panel Faktury, kiedy, jakie braki świadomie
+      // pominięto. Zapisywany w operacji przy tworzeniu faktury.
+      const audyt = { kto: String(o.kto).trim(), data: now().toISOString(), akceptowaneBraki: a.sumy.braki };
 
       const kolejka = [
         ...(etap === 'UTWORZ' ? [] : operacje.filter(op => op.status === S.CREATED)),
         ...(etap === 'WYSLIJ' ? [] : [
           ...operacje.filter(op => [S.PREPARED, S.APPROVED].includes(op.status)),
-          ...a.plany.filter(p => wybrany(p.contactId) && !operacje.some(op => op._id === p.operationId))
+          ...a.plany.filter(p => wybrany(p.contactId) && !aktywna(operacje, p.operationId))
         ])
       ].slice(0, limit);
 
@@ -1424,6 +1446,14 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
         if (x.status === S.CREATED) {
           r = await wyslij(x, lock);
         } else {
+          // Świeży odczyt zamówień przed każdą fakturą — w trakcie partii
+          // zamówienie mogło zostać opłacone, anulowane lub zafakturowane.
+          const teraz = analizuj(await wczytajStan());
+          if (!x.status && !teraz.plany.some(p => p.operationId === x.operationId && p.fingerprint === x.fingerprint)) {
+            wyniki.push({ operationId: x.operationId, klient: x.klient, status: 'POMINIETO', uwaga: 'Zamówienia zmieniły się w trakcie partii — sprawdź PREVIEW.' });
+            continue;
+          }
+
           // Nowy plan albo PREPARED po awarii → przypisania → APPROVED.
           let op = x.status === S.APPROVED
             ? x
@@ -1432,11 +1462,11 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
           if (op.status !== S.APPROVED) {
             r = { op };
           } else {
-            const zmiana = aktualny(op, a);
+            const zmiana = aktualny(op, teraz);
             if (zmiana) {
               r = { op: await journal.anuluj(op, zmiana), uwaga: 'Anulowano przed createInvoice — sprawdź PREVIEW.' };
             } else {
-              r = await utworz(op, lock);
+              r = await utworz(op, lock, audyt);
               if (!r.stop && r.op.status === S.CREATED && etap === 'OBA' && czas()) r = await wyslij(r.op, lock);
             }
           }
@@ -1459,7 +1489,7 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
         uporzadkowane: uporzadkowane.map(x => `${x._id} → ${x.status}`),
         wyniki,
         zatrzymano,
-        pozostaloDoUtworzenia: ile(S.APPROVED) + ile(S.PREPARED) + a.plany.filter(p => !po.some(op => op._id === p.operationId)).length,
+        pozostaloDoUtworzenia: ile(S.APPROVED) + ile(S.PREPARED) + a.plany.filter(p => !aktywna(po, p.operationId)).length,
         pozostaloDoWyslania: ile(S.CREATED),
         doRecznejDecyzji: po.filter(op => op.status === S.NEEDS_REVIEW).map(op => ({ operationId: op._id, klient: op.klientNazwa, powod: op.powod, blad: op.blad }))
       };
