@@ -86,3 +86,33 @@ Ponowny przegląd: oczekuje.
 
 Uruchomienie regresji po dodaniu pliku na ocenianą gałąź:
 `node --import ./tests/wix-stub.mjs --test reviews/november-944a44c.regression.mjs`
+
+## Odczyt danych witryny przez konektor Wix (2026-10-26, tylko odczyt)
+
+Wykonane wyłącznie zapytania odczytu (CMS Query Data Items, Get Data Collection, Search Orders, List Transactions For Multiple Orders, List Invoices For Multiple Orders, próba Query Invoices v4). Żadnych zapisów. Dane zanonimizowane (skrócone ID, bez nazw osób).
+
+**Środowisko**
+- centrumtoto.pl: Wix Invoices **V1**. `POST /invoices/v4/invoices/query` → **428**: „The site still uses the legacy invoices service, which is only accessible through Velo”. Potwierdza: Get Paid niedostępne; faktur V1 nie da się odczytać przez REST/konektor — kształt `getInvoice` (currency, metadata, lineItems) i ujemne ceny można sprawdzić tylko w Velo.
+- `FakturyMiesieczne`: 74 wiersze, wszystkie `2026-10`, status `WYSLANA`, bez pola `rodzaj`, `orderIds` puste. Brak wierszy za `2026-11`. Schemat CMS: `title, miesiac, klientContactId, klientNazwa, status, invoiceId, invoiceVersion:NUMBER, kwota, pozycje, orderIds:ARRAY_STRING, blad` — pola v2 (`rodzaj`, `operationId`, `orderId`, `audytFaktur`, `historia`…) nie są zdefiniowane. Przykładowa faktura październikowa ma `invoiceVersion = 15` po wysyłce (wersja rośnie wielokrotnie — potwierdza potrzebę świeżego `getInvoice` przed `sendInvoice`).
+- `GeneratorBlokady`: pusta.
+
+**UmowyMiesiace 2026-11**: 108 wierszy, każdy z `orderId`; statusy: DONE 82, CANCELED 16, CANCELLED 10; 95 unikalnych kontaktów; brak duplikatów `orderId`/`umowaId`. `stan` zawiera m.in. `financialAdjustments` (7 wierszy, np. `{amount: -180, type: ORDER_DISCOUNT, bookingId, description}`, też `ORDER_DISCOUNT_REVERSAL` i niespójne `DISCOUNT +180`), `repair`, `sourceOrderId`, `termination`. `kwota` w CMS = wartość **przed** rabatem.
+
+**Zamówienia (108)**
+- Search Orders z `id $in` i `channelInfo.externalOrderId $in`: działają (REST), 0 obcych wyników, bez kolejnych stron.
+- Utworzone: 97 we wrześniu, 11 w październiku — potwierdza, że data utworzenia nie wskazuje miesiąca.
+- Statusy (cykl | zamówienie | płatność): DONE|APPROVED|NOT_PAID 79; DONE|APPROVED|PAID 1 (zamówienie 0 zł, stawka 0); DONE|CANCELED|NOT_PAID 2; CANCELED|CANCELED 16; CANCELLED|CANCELED 10.
+- Kontakt zamówienia = kontakt cyklu: 108/108. Pozycje = wizyty BOOKED: 82/82 dla DONE.
+- Rabaty: 22 zamówienia, 24 rabaty, wszystkie `merchantDiscount` GLOBAL (kwota bez groszy, np. `"160"`), rozłożone na pozycje (`lineItemDiscounts`, np. 4×40). Jedno zamówienie ma dwa rabaty (2×180). Opisy: „Anulowane spotkanie DD.10.2026” oraz jeden „Zewnętrzne finansowanie” 320 zł (rabat niezwiązany z odwołaniem).
+- Podatek 0 we wszystkich.
+- Transakcje: brak płatności i zwrotów dla wszystkich 108 zamówień.
+- Order Invoices: **1 zamówienie z fakturą** (DONE, APPROVED, NOT_PAID; appId `1380b703-…`) — realny przypadek „nieopłacone, faktura już wystawiona”.
+
+**Rozbieżności z regułami skryptu (fd3ded1)**
+1. `externalOrderId` ≠ `TOTO:2026-11:{umowaId}` w 11 zamówieniach cykli DONE: 5 × format `2026-11/{umowaId}`, 4 × brak `externalOrderId` (2 z `stan.sourceOrderId`), 1 × `…:repair1`, 1 × `…/restore1`. W każdym kontakt i pozycje (bookingId) zgadzają się z cyklem. Skrypt kieruje je do sprawdzenia.
+2. Dla zamówień `repair1`/`restore1` istnieje wcześniejsze zamówienie z kluczem bazowym w stanie CANCELED. Kontrola „innych zamówień tej umowy” kieruje je do sprawdzenia, mimo że stare jest anulowane.
+3. 2 cykle DONE wskazują zamówienie CANCELED (opisy pozycji „CANCELED / …”). Skrypt klasyfikuje je jako ANULOWANE — niespójność CMS ↔ zamówienie przechodzi bez ręcznej decyzji.
+4. Opisy pozycji mają różne formaty („YYYY-MM-DD HH:mm / 2026-11”, „Nov 6, 2026, 3:00 PM / …”, „2 lis 2026, 19:00 / …”, bez miesiąca). Lista dat w opisie faktury byłaby niepełna dla części zamówień.
+5. Zamówienie PAID ma 0 zł — skrypt klasyfikuje je jako ZEROWE (poprawnie, przed regułą PAID).
+
+Ujemna cena pozycji w Invoices V1 i rzeczywisty kształt `getInvoice` pozostają niezweryfikowane (niedostępne przez REST).
