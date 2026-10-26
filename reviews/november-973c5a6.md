@@ -39,3 +39,11 @@ Nie postuluję powrotu do 3600 linii. Najpierw dwa niewielkie poprawienia przep�
 | Audyt | Przyjęte częściowo | `audyt` zapisywany przy CREATING z RUN, który tworzy fakturę: kto, data, `akceptowaneBraki`, `fingerprint`. Ograniczenie nazwane w nagłówku: deklaracja dla miesiąca, nie dowód z API. Zakres jako osobne pole pominięty — wynika z opisu potwierdzenia. | istniejący test bramki |
 
 Testy regresji dopisane do `tests/CreateInvoicesNovember.test.js`. `npm test`: 54/54. Ponowny przegląd: oczekuje.
+
+## Zmiany na prośbę właściciela — commity 90a8018, 68accc3, bf719c8
+
+- Zamówienie z fakturą w Order Invoices jest pomijane zawsze, jako pierwsza reguła klasyfikacji. Właściciel potwierdził (2026-10-26), że faktury listopadowe istnieją wyłącznie jako faktury do zamówień; ręczne potwierdzenie panelu Faktury usunięto.
+- Jedno standardowe przejście: jedyna stała `WYSTAWIAJ` (false = PREVIEW z PROBE i statusami dziennika; true = partia do 3 faktur, tworzenie + wysyłka). Usunięto TRYB, opcje RUN, `akceptujBraki`, wybór kontaktów i etapów oraz rabat kwotowy faktury (rabat zawsze ujemną pozycją).
+- **Świadome osłabienie zatwierdzania:** RUN nie porównuje już sumy z wcześniejszym PREVIEW. Faktura powstaje według stanu zamówień odczytanego tuż przed jej utworzeniem (S1) i jest porównywana z planem przed wysyłką. Zmiana zamówienia między PREVIEW a RUN nie zatrzymuje pracy. Braki kompletności są raportowane, ale nie blokują RUN (te zamówienia nie są fakturowane). Decyzja właściciela.
+
+`npm test`: 54/54.
