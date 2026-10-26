@@ -1,0 +1,12 @@
+{
+  "name": "wix-automations",
+  "private": true,
+  "type": "module",
+  "description": "Kod backendowy Wix Velo CTD Toto. Testy logiki fakturowania uruchamiane lokalnie w Node (bez API Wix).",
+  "scripts": {
+    "test": "node --import ./tests/register.mjs --test \"tests/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
