@@ -353,7 +353,7 @@ function srodowisko(spec) {
 // Opcje RUN zgodne z bieżącym PREVIEW (jak administrator).
 async function opcjeZPodgladu(env, extra = {}) {
   const p = await env.proces.podglad();
-  return { oczekiwanaSuma: p.doZatwierdzenia.suma, maxFaktur: 5, ...extra };
+  return { maxFaktur: 5, ...extra };
 }
 
 async function run(env, extra = {}) {
@@ -762,13 +762,13 @@ test('18. suma nowych faktur = rozliczenie zamówień źródłowych', async () =
   assert.equal(p.kontroleOk, true);
   assert.deepEqual([p.sumy.brutto, p.sumy.rabaty, p.sumy.netto], ['3910.00', '250.50', '3659.50']);
   assert.deepEqual([p.sumy.doNowychFaktur, p.sumy.doSprawdzenia, p.sumy.anulowane, p.sumy.juzRozliczone], ['1739.50', '640.00', '640.00', '640.00']);
-  assert.deepEqual(p.doZatwierdzenia, { liczba: 2, suma: '1739.50' });
+  assert.deepEqual(p.wszystkieFaktury, { liczba: 2, suma: '1739.50' });
 
   await wykonajWszystko(env);
   assert.equal(sumaFaktur(env), 173950);
   const po = await env.proces.podglad();
   assert.deepEqual([po.sumy.juzRozliczone, po.sumy.doNowychFaktur, po.sumy.netto], ['2379.50', '0.00', p.sumy.netto]);
-  assert.deepEqual(po.doZatwierdzenia, p.doZatwierdzenia, 'liczba i suma stałe między RUN');
+  assert.deepEqual(po.wszystkieFaktury, p.wszystkieFaktury);
 });
 
 // ======================================================
@@ -783,16 +783,14 @@ test('PREVIEW nie zapisuje niczego i nie tworzy faktur', async () => {
   assert.equal(env.inv.utworzenia, 0);
 });
 
-test('bramka: RUN wymaga sumy równej bieżącemu PREVIEW; audyt w operacji', async () => {
+test('bramka: RUN odmawia przy niepełnych odczytach; audyt w operacji', async () => {
   const env = jedenKlient();
-  const ok = await opcjeZPodgladu(env);
-  for (const zle of [{ oczekiwanaSuma: '600.00' }, { oczekiwanaSuma: '' }]) {
-    assert.equal((await env.proces.wykonaj({ ...ok, ...zle })).status, 'ODMOWA');
-  }
-  assert.equal(env.inv.utworzenia, 0);
+  env.gateway.awariaApi.transakcje = true;
+  assert.equal((await run(env)).status, 'ODMOWA');
   assert.equal(operacje(env).length, 0);
-  await env.proces.wykonaj(ok);
-  assert.equal(operacje(env)[0].audyt.zatwierdzonaSuma, '640.00');
+  env.gateway.awariaApi.transakcje = false;
+  await run(env);
+  assert.equal(operacje(env)[0].audyt.sumaMiesiaca, '640.00');
   assert.ok(operacje(env)[0].audyt.fingerprint);
 });
 test('R1: wpis dziennika za listopad spoza modelu — klient do sprawdzenia; bez kontaktu — brak', async () => {
@@ -863,7 +861,7 @@ test('awaria między PREPARED a przypisaniami — kolejny RUN kończy przygotowa
   assert.equal(operacje(env)[0].status, S.PREPARED);
 
   const p = await env.proces.podglad();
-  assert.deepEqual(p.doZatwierdzenia.liczba, 1, 'PREPARED nie jest liczona podwójnie');
+  assert.deepEqual(p.wszystkieFaktury.liczba, 1, 'PREPARED nie jest liczona podwójnie');
   await wykonajWszystko(env);
   assert.equal(env.inv.utworzenia, 1);
   assert.equal(faktury(env)[0].totals.total, 1280);

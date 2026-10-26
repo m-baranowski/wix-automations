@@ -41,18 +41,18 @@
  *  Statusy: PREPARED → APPROVED → CREATING → CREATED → SENDING → SENT,
  *           NEEDS_REVIEW, CANCELLED.
  *
- * JEDNO STANDARDOWE PRZEJŚCIE — jedna stała ZATWIERDZAM_SUME:
- *  1. ZATWIERDZAM_SUME = '' → zapisz, odpal automatyzację. To PREVIEW
+ * JEDNO STANDARDOWE PRZEJŚCIE — jedna stała WYSTAWIAJ:
+ *  1. WYSTAWIAJ = false → zapisz, odpal automatyzację. To PREVIEW
  *     (tylko odczyt). Logi: FAKTURY_PREVIEW_ZAMOWIENIE (tabela),
  *     _FAKTURA (proponowane faktury), _SUMY, _BRAKI, _DZIENNIK (statusy),
  *     _PROBE (struktura ostatniej faktury: brakujaceDlaKontroli = []),
- *     _DO_ZATWIERDZENIA (liczba i suma wszystkich faktur miesiąca).
- *  2. Przejrzyj doRecznejDecyzji i sumy. Wpisz sumę z _DO_ZATWIERDZENIA
- *     do ZATWIERDZAM_SUME, zapisz i odpalaj automatyzację, aż log
- *     FAKTURY_RUN pokaże pozostaloDoUtworzenia = 0 i pozostaloDoWyslania = 0.
- *     Każde odpalenie tworzy i wysyła do 3 faktur. Suma jest stała między
- *     odpaleniami; gdy dane się zmienią, RUN odmówi — wróć do kroku 1.
- *  3. ZATWIERDZAM_SUME = '' i odpal: doNowychFaktur = 0. Wyłącz automatyzację.
+ *     _WSZYSTKIE_FAKTURY (liczba i suma faktur miesiąca).
+ *  2. Przejrzyj doRecznejDecyzji i sumy. WYSTAWIAJ = true, zapisz
+ *     i odpalaj automatyzację, aż log FAKTURY_RUN pokaże
+ *     pozostaloDoUtworzenia = 0 i pozostaloDoWyslania = 0.
+ *     Każde odpalenie tworzy i wysyła do 3 faktur, zawsze według
+ *     aktualnego stanu zamówień (odczyt przed każdą fakturą).
+ *  3. WYSTAWIAJ = false i odpal: doNowychFaktur = 0. Wyłącz automatyzację.
  *  Faktury do zamówień (Order Invoices) są pomijane automatycznie. Według
  *  właściciela (2026-10-26) faktur listopadowych bez zamówienia nie ma.
  *  Jeśli Wix odrzuci ujemną pozycję rabatu, pierwsza faktura z rabatem
@@ -117,9 +117,9 @@ import { createHash, randomBytes } from 'crypto';
 // URUCHOMIENIE
 // ======================================================
 
-// Puste — PREVIEW (tylko odczyt). Suma z FAKTURY_PREVIEW_DO_ZATWIERDZENIA
-// — każde odpalenie tworzy i wysyła kolejną partię faktur.
-const ZATWIERDZAM_SUME = '';
+// false — PREVIEW (tylko odczyt); true — każde odpalenie tworzy i wysyła
+// kolejną partię faktur.
+const WYSTAWIAJ = false;
 
 const CFG = {
   miesiac: '2026-11',
@@ -759,12 +759,12 @@ function analizuj(stan) {
   // plany) — stała między kolejnymi RUN, dopóki dane się nie zmienią.
   const aktywne = [...stan.operacje.values()].filter(op => op.status !== S.CANCELLED);
   const nowe = plany.filter(p => !aktywna(aktywne, p.operationId));
-  const doZatwierdzenia = {
+  const wszystkieFaktury = {
     liczba: aktywne.length + nowe.length,
     suma: zl(suma(aktywne, op => op.kwotaGrosze || 0) + suma(nowe, p => p.razem))
   };
 
-  return { zamowienia, plany, cykleBezZamowien, sumy, doZatwierdzenia, ostrzezenia, bledyGlobalne: stan.bledyGlobalne };
+  return { zamowienia, plany, cykleBezZamowien, sumy, wszystkieFaktury, ostrzezenia, bledyGlobalne: stan.bledyGlobalne };
 }
 
 // Anulowana operacja nie blokuje poprawionego planu z tym samym ID
@@ -1221,7 +1221,7 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
       arytmetykaOk: a.sumy.arytmetykaOk,
       braki: a.sumy.braki,
       kontroleOk: a.sumy.kontroleOk,
-      doZatwierdzenia: a.doZatwierdzenia,
+      wszystkieFaktury: a.wszystkieFaktury,
       bledyGlobalne: a.bledyGlobalne,
       ostrzezenia: a.ostrzezenia,
       tabela: a.zamowienia.map(wierszTabeli),
@@ -1258,7 +1258,7 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
     log.log('FAKTURY_PREVIEW_BRAKI', JSON.stringify(wynik.braki));
     log.log('FAKTURY_PREVIEW_DZIENNIK', JSON.stringify({ statusy: wynik.dziennik, wymagajaDecyzji: wynik.wymagajaDecyzji }));
     log.log('FAKTURY_PREVIEW_PROBE', JSON.stringify(wynik.probe));
-    log.log('FAKTURY_PREVIEW_DO_ZATWIERDZENIA', JSON.stringify(wynik.doZatwierdzenia));
+    log.log('FAKTURY_PREVIEW_WSZYSTKIE_FAKTURY', JSON.stringify(wynik.wszystkieFaktury));
 
     return wynik;
   }
@@ -1370,15 +1370,12 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
     return { op: await journal.zmien(op, [S.SENDING], { status: S.SENT, wyslano: now().toISOString(), blad: '' }) };
   }
 
-  // RUN rusza tylko przy pełnych odczytach, zgodnej arytmetyce i sumie
-  // równej bieżącemu PREVIEW. Braki kompletności nie blokują — te
-  // zamówienia i tak nie są fakturowane (trafiają do ręcznej decyzji).
-  function bramka(a, o) {
+  // RUN rusza tylko przy pełnych odczytach i zgodnej arytmetyce sum.
+  // Braki kompletności nie blokują — te zamówienia i tak nie są
+  // fakturowane (trafiają do ręcznej decyzji).
+  function bramka(a) {
     if (a.bledyGlobalne.length) return a.bledyGlobalne.join(' ');
     if (!a.sumy.arytmetykaOk) return 'Kontrole sum nie przeszły — zobacz PREVIEW.';
-    if (pusta(o.oczekiwanaSuma) || grosze(o.oczekiwanaSuma) !== grosze(a.doZatwierdzenia.suma)) {
-      return `ZATWIERDZAM_SUME ≠ PREVIEW (teraz: ${a.doZatwierdzenia.liczba} faktur, ${a.doZatwierdzenia.suma} zł).`;
-    }
     return null;
   }
 
@@ -1401,13 +1398,12 @@ function createProcess({ gateway, journal, now = () => new Date(), log = console
       const uporzadkowane = await uporzadkuj((await journal.wiersze()).operacje);
       const a = analizuj(await wczytajStan());
 
-      const odmowa = bramka(a, o);
+      const odmowa = bramka(a);
       if (odmowa) return { tryb: 'RUN', status: 'ODMOWA', blad: odmowa, uporzadkowane: uporzadkowane.map(x => x._id) };
 
       const operacje = [...(await journal.wiersze()).operacje.values()];
-      // Audyt: zatwierdzona suma, data i braki widoczne przy zatwierdzeniu.
-      // Zapisywany w operacji przy tworzeniu faktury.
-      const audyt = { zatwierdzonaSuma: a.doZatwierdzenia.suma, data: now().toISOString(), braki: a.sumy.braki };
+      // Audyt: stan miesiąca i braki w chwili tworzenia faktury.
+      const audyt = { sumaMiesiaca: a.wszystkieFaktury.suma, data: now().toISOString(), braki: a.sumy.braki };
 
       const kolejka = [
         ...(etap === 'UTWORZ' ? [] : operacje.filter(op => op.status === S.CREATED)),
@@ -1511,7 +1507,7 @@ export const invoke = async () => {
   const p = createProcess({ gateway, journal: createJournal(gateway.db) });
 
   try {
-    zaloguj(ZATWIERDZAM_SUME ? await p.wykonaj({ oczekiwanaSuma: ZATWIERDZAM_SUME }) : await p.podglad());
+    zaloguj(WYSTAWIAJ ? await p.wykonaj() : await p.podglad());
   } catch (e) {
     console.error('FAKTURY_BLAD', e?.name || '', msg(e));
     throw e;
