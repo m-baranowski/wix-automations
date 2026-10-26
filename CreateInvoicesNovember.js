@@ -18,8 +18,11 @@
  * ------------------------------------------------------------------
  * Dla każdego wiersza UmowyMiesiace (miesiac = 2026-11, z orderId):
  *  - weryfikacja: kontakt zamówienia = kontakt cyklu = kontakt umowy,
- *    externalOrderId = TOTO:2026-11:{umowaId}, PLN, pozycje = wizyty
- *    BOOKED z planu, cena = stawka, brak innych zamówień z tym kluczem;
+ *    PLN, pozycje = dokładnie wizyty BOOKED z planu cyklu (bookingId),
+ *    cena = stawka, brak innych AKTYWNYCH zamówień tej umowy i miesiąca;
+ *    externalOrderId: TOTO:2026-11:{umowaId}, ten sam z :repairN
+ *    lub /restoreN, 2026-11/{umowaId} albo brak (zamówienia ręczne —
+ *    powiązanie dowodzą wtedy kontakt i wizyty); inny klucz = kontrola;
  *  - uzgodnienie kwot w groszach: pozycje = subtotal,
  *    suma appliedDiscounts = priceSummary.discount, total = subtotal − rabat;
  *  - klasyfikacja:
@@ -27,7 +30,8 @@
  *      faktura już jest (Wix lub dziennik) ...... ROZLICZONE (bez 2. faktury)
  *      PAID bez potwierdzonej faktury ........... DO_SPRAWDZENIA
  *      PARTIALLY_PAID / PENDING / zwroty ........ DO_SPRAWDZENIA
- *      anulowane ................................ ANULOWANE
+ *      anulowane (cykl też anulowany) ........... ANULOWANE
+ *      anulowane przy cyklu DONE ................ DO_SPRAWDZENIA
  *      0 zł po rabacie .......................... ZEROWE
  *  - łączenie DO_FAKTURY wyłącznie po contactId (nigdy po nazwie/e-mailu);
  *  - faktura: pozycja usługi na zamówienie + OSOBNA UJEMNA POZYCJA dla
@@ -40,8 +44,14 @@
  * ------------------------------------------------------------------
  * DZIENNIK FakturyMiesieczne (wiersze październikowe bez zmian)
  * ------------------------------------------------------------------
- * Nowe pole `rodzaj` rozróżnia dwa typy wierszy (dodaj pola w CMS,
- * aby były widoczne w tabeli):
+ * Nowe pole `rodzaj` rozróżnia dwa typy wierszy. PRZED PREPARE dodaj
+ * w CMS pola (stan schematu z 2026-10-26 ich nie ma): rodzaj, wersjaModelu,
+ * operationKey, operationId, orderId, email, numeryZamowien, umowaIds,
+ * invoiceNumber, kwotaGrosze, bruttoGrosze, rabatyGrosze, rabaty,
+ * rabatFaktury, trybRabatu, fingerprint, hashPol, utworzenieRozpoczete,
+ * wysylkaRozpoczeta, proby, powodPrzegladu, audytFaktur, historia,
+ * writeToken, status przypisania i znaczniki czasu (tekst ISO).
+ * Typy wierszy:
  *  FAKTURA    _id = operationId = hash(miesiąc, contactId, posortowane
  *             orderIds). Pola: status, invoiceId, invoiceVersion,
  *             orderIds, numeryZamowien, umowaIds, klientContactId,
@@ -67,6 +77,11 @@
  * ani wysłać tej samej faktury drugi raz.
  *
  * KOLEJNOŚĆ PRACY
+ * 0. TRYB 'PROBE' — tylko odczyt: getInvoice ostatniej faktury
+ *    z dziennika (październik) i log FAKTURY_PROBE ze strukturą
+ *    odpowiedzi (nazwy pól, typy, bez danych osobowych). Wymagane:
+ *    brakujaceDlaKontroli = []. Inaczej kontrola faktur przed wysyłką
+ *    zablokuje każdą fakturę — zgłoś wynik przed dalszymi krokami.
  * 1. TRYB 'PREVIEW' — tylko odczyt. Logi: FAKTURY_PREVIEW_ZAMOWIENIE
  *    (tabela zamówień), FAKTURY_PREVIEW_FAKTURA (proponowane faktury),
  *    FAKTURY_PREVIEW_SUMY (brutto, rabaty, netto, już rozliczone,
@@ -176,7 +191,7 @@ import { createHash, randomBytes } from 'crypto';
 // URUCHOMIENIE — ustaw przed wywołaniem automatyzacji
 // ##############################################################
 
-// PREVIEW | PREPARE | APPROVE | RUN | STATUS | RESOLVE | UNLOCK
+// PREVIEW | PREPARE | APPROVE | RUN | STATUS | RESOLVE | UNLOCK | PROBE
 // PREVIEW niczego nie zapisuje. Po pracy wróć do 'PREVIEW'.
 const TRYB = 'PREVIEW';
 
@@ -210,7 +225,10 @@ const OPCJE = {
   //          ANULUJ | ZAMKNIJ_RECZNIE
   RESOLVE: { operationId: '', decyzja: '', invoiceId: '', uwagi: '', potwierdzam: false },
 
-  UNLOCK: { potwierdzam: false }
+  UNLOCK: { potwierdzam: false },
+
+  // Pusty invoiceId = ostatnia faktura z dziennika (październik).
+  PROBE: { invoiceId: '' }
 };
 
 // ##############################################################
@@ -412,6 +430,30 @@ const claimId = orderId =>
 const orderKey = (month, umowaId) =>
   `TOTO:${month}:${umowaId}`;
 
+// Klucze zamówień spotykane na witrynie (odczyt 2026-10-26):
+//  TOTO:{m}:{umowa}             — generatorUmow.js
+//  TOTO:{m}:{umowa}:repairN     — naprawa zamówienia (stare anulowane)
+//  TOTO:{m}:{umowa}/restoreN    — odtworzenie zamówienia (stare anulowane)
+//  {m}/{umowa}                  — zamówienia tworzone poza generatorem
+//  brak                         — zamówienia ręczne; powiązanie dowodzi
+//                                 wtedy zgodność kontaktu i wizyt z cyklem
+const kluczeWyszukiwania = (month, umowaId) => [
+  orderKey(month, umowaId),
+  `${month}/${umowaId}`
+];
+
+function kluczZgodny(ext, month, umowaId) {
+  if (!ext) return true;
+
+  const baza = orderKey(month, umowaId);
+
+  return (
+    ext === baza ||
+    ext === `${month}/${umowaId}` ||
+    (ext.startsWith(baza) && /^(:repair|\/restore)\d+$/.test(ext.slice(baza.length)))
+  );
+}
+
 // ======================================================
 // ZAMÓWIENIE -> POSTAĆ ZNORMALIZOWANA
 // ======================================================
@@ -611,10 +653,10 @@ function sprawdzPowiazanie(o, row, umowa, cfg) {
     problemy.push('Kontakt umowy ≠ kontakt w UmowyMiesiace.');
   }
 
-  if (o.externalOrderId !== orderKey(month, row.umowaId)) {
+  if (!kluczZgodny(o.externalOrderId, month, row.umowaId)) {
     problemy.push(
-      `externalOrderId "${o.externalOrderId}" ≠ ` +
-      `"${orderKey(month, row.umowaId)}".`
+      `externalOrderId "${o.externalOrderId}" nie wskazuje umowy ` +
+      `${row.umowaId} i miesiąca ${month}.`
     );
   }
 
@@ -696,6 +738,18 @@ function klasyfikujBazowo(w, cfg) {
   }
 
   if (o.status === 'CANCELED') {
+    // Cykl zakończony (DONE), a zamówienie anulowane: CMS i eCommerce
+    // się nie zgadzają — decyzja ręczna, nie ciche wykluczenie.
+    if (w.row.status === 'DONE') {
+      return {
+        kategoria: K.DO_SPRAWDZENIA,
+        powody: [
+          'Cykl ma status DONE, a zamówienie jest anulowane — ' +
+          'sprawdź, czy wizyty się odbyły i czy jest zamówienie zastępcze.'
+        ]
+      };
+    }
+
     if (w.fakturyWix?.length) {
       return {
         kategoria: K.DO_SPRAWDZENIA,
@@ -853,13 +907,16 @@ function klasyfikuj(w, cfg) {
 // PLAN FAKTURY DLA GRUPY ZAMÓWIEŃ JEDNEGO KONTAKTU
 // ======================================================
 
+// Daty tylko wtedy, gdy odczytano je ze wszystkich pozycji — opisy
+// pozycji na witrynie mają różne formaty, a niepełna lista myli.
 function opisDat(daty) {
-  const d = daty
-    .filter(Boolean)
+  if (!daty.length || daty.some(x => !x)) return '';
+
+  const d = [...daty]
     .sort()
     .map(x => `${x.slice(8, 10)}.${x.slice(5, 7)}`);
 
-  return d.length && d.length <= 8 ? ` (${d.join(', ')})` : '';
+  return d.length <= 8 ? ` (${d.join(', ')})` : '';
 }
 
 const wizyt = n =>
@@ -1197,6 +1254,48 @@ function sprawdzFakture(faktura, op, opcje = {}) {
   return problemy;
 }
 
+// Struktura odpowiedzi getInvoice bez danych osobowych: nazwy pól,
+// typy i to, czego wymaga sprawdzFakture().
+function strukturaFaktury(f) {
+  const typ = v => (Array.isArray(v) ? 'array' : v === null ? 'null' : typeof v);
+  const klucze = v => (v && typeof v === 'object' ? Object.keys(v).sort() : []);
+  const linie = Array.isArray(f?.lineItems) ? f.lineItems : [];
+
+  const wymagane = {
+    'id.id': typeof f?.id?.id === 'string',
+    'id.version': typeof f?.id?.version === 'number',
+    currency: typeof f?.currency === 'string',
+    'customer.contactId': typeof f?.customer?.contactId === 'string',
+    'metadata.sourceRefId': f?.metadata?.sourceRefId !== undefined,
+    'totals.total': f?.totals?.total !== undefined,
+    'lineItems[].name': linie.length > 0 && linie.every(l => typeof l.name === 'string'),
+    'lineItems[].price': linie.length > 0 && linie.every(l => l.price !== undefined),
+    'lineItems[].quantity': linie.length > 0 && linie.every(l => l.quantity !== undefined),
+    wasSent: typeof f?.wasSent === 'boolean'
+  };
+
+  return {
+    klucze: klucze(f),
+    idKlucze: klucze(f?.id),
+    statusFaktury: f?.status,
+    wasSent: f?.wasSent,
+    waluta: f?.currency,
+    customerKlucze: klucze(f?.customer),
+    metadataKlucze: klucze(f?.metadata),
+    totalsKlucze: klucze(f?.totals),
+    totalsTotalTyp: typ(f?.totals?.total),
+    discount: f?.discount ? { klucze: klucze(f.discount), type: f.discount.type } : null,
+    datesKlucze: klucze(f?.dates),
+    liczbaPozycji: linie.length,
+    pozycjaKlucze: klucze(linie[0]),
+    cenaTyp: typ(linie[0]?.price),
+    iloscTyp: typ(linie[0]?.quantity),
+    ujemneCeny: linie.some(l => Number(l.price) < 0),
+    wymagane,
+    brakujaceDlaKontroli: Object.entries(wymagane).filter(([, ok]) => !ok).map(([k]) => k)
+  };
+}
+
 // ======================================================
 // ANALIZA MIESIĄCA
 // ======================================================
@@ -1266,9 +1365,13 @@ function analizuj(stan, cfg) {
       );
     }
 
-    const klucz = orderKey(cfg.miesiac, row.umowaId);
+    // Inne AKTYWNE zamówienia z kluczem tej umowy i miesiąca.
+    // Anulowane poprzedniki (repair/restore) nie są duplikatem.
     const inne = stan.indeksKluczy
-      ? (stan.indeksKluczy.get(klucz) || []).filter(id => id !== row.orderId)
+      ? kluczeWyszukiwania(cfg.miesiac, row.umowaId)
+          .flatMap(k => stan.indeksKluczy.get(k) || [])
+          .filter(x => x.id !== row.orderId && x.status !== 'CANCELED')
+          .map(x => `${x.id} (${x.status})`)
       : null;
 
     const przypisanie = stan.przypisania.get(row.orderId) || null;
@@ -1696,6 +1799,7 @@ function wierszTabeli(w) {
     netto: o
       ? zl(o.razem)
       : kwotaDoSum(w) === null ? 'NIEZNANA' : `~${zl(kwotaDoSum(w))}`,
+    kluczZamowienia: o ? o.externalOrderId || '(brak)' : '',
     statusZamowienia: o?.status || '',
     platnosc: o?.paymentStatus || '',
     fakturyWix: w.fakturyWix
@@ -2109,6 +2213,15 @@ function createJournal(db, cfg, opts = {}) {
     przypisaniaDla,
     operacjeDla,
     operacja: id => db.get(LEDGER, id),
+
+    // Ostatnia faktura z dziennika (np. październik) — do trybu PROBE.
+    async ostatniaFaktura() {
+      const rows = (await db.find(LEDGER, {})).filter(r => r.invoiceId);
+      rows.sort((a, b) =>
+        String(b._createdDate || '').localeCompare(String(a._createdDate || ''))
+      );
+      return rows[0] || null;
+    },
     zmien,
     przygotuj,
     anuluj,
@@ -2247,7 +2360,7 @@ async function zamowienia(ids) {
 }
 
 /**
- * Indeks externalOrderId -> [orderId] (wykrywa dodatkowe zamówienia
+ * Indeks externalOrderId -> [{ id, status }] (wykrywa dodatkowe zamówienia
  * tej samej umowy i miesiąca). null = nie udało się sprawdzić.
  */
 async function indeksKluczy(klucze) {
@@ -2275,7 +2388,9 @@ async function indeksKluczy(klucze) {
           // Zamówienie spoza listy = filtr nie zadziałał.
           if (!part.includes(k)) throw new Error('Filtr externalOrderId zignorowany.');
           const list = map.get(k) || [];
-          if (!list.includes(idOf(o))) list.push(idOf(o));
+          if (!list.some(x => x.id === idOf(o))) {
+            list.push({ id: idOf(o), status: o.status || '' });
+          }
           map.set(k, list);
         }
 
@@ -2478,7 +2593,7 @@ function createProcess({ gateway, journal, cfg, now, log }) {
     const umowaIds = [...new Set(rows.map(r => r.umowaId).filter(Boolean))];
     const klucze = rows
       .filter(r => r.umowaId)
-      .map(r => `TOTO:${cfg.miesiac}:${r.umowaId}`);
+      .flatMap(r => kluczeWyszukiwania(cfg.miesiac, r.umowaId));
 
     const [umowy, zamowienia, indeksKluczy, fakturyWix, transakcje] =
       await Promise.all([
@@ -3238,6 +3353,29 @@ function createProcess({ gateway, journal, cfg, now, log }) {
   // STATUS
   // ======================================================
 
+  // ======================================================
+  // PROBE — odczyt struktury jednej faktury (getInvoice), bez zapisów.
+  // Faktur Invoices V1 nie da się odczytać przez REST (428), więc kształt
+  // odpowiedzi potwierdzamy w Velo. Logowane są tylko nazwy pól i typy.
+  // ======================================================
+
+  async function sonda({ invoiceId = '' } = {}) {
+    let id = invoiceId;
+    let zrodlo = 'OPCJE.PROBE.invoiceId';
+
+    if (!id) {
+      const r = await journal.ostatniaFaktura();
+      id = r?.invoiceId || '';
+      zrodlo = r ? `dziennik ${r.miesiac}` : 'brak';
+    }
+
+    if (!id) return { tryb: 'PROBE', status: 'ODMOWA', blad: 'Brak invoiceId.' };
+
+    const f = await gateway.pobierzFakture(id);
+
+    return { tryb: 'PROBE', status: 'OK', zrodlo, ...strukturaFaktury(f) };
+  }
+
   async function status() {
     const ops = [...(await journal.operacje()).values()];
     const liczby = {};
@@ -3412,6 +3550,7 @@ function createProcess({ gateway, journal, cfg, now, log }) {
     zatwierdz,
     wykonaj,
     status,
+    sonda,
     rozstrzygnij,
     zwolnijBlokade
   };
@@ -3437,6 +3576,7 @@ async function wykonajTryb(p, tryb, opcje) {
     case 'STATUS': return p.status();
     case 'RESOLVE': return p.rozstrzygnij(opcje);
     case 'UNLOCK': return p.zwolnijBlokade(opcje);
+    case 'PROBE': return p.sonda(opcje);
     default: throw new Error(`Nieznany TRYB: ${tryb}`);
   }
 }
@@ -3481,6 +3621,8 @@ export const _test = {
   LOCK_ID,
   GENERATOR_LOCK_ID,
   grosze,
+  kluczZgodny,
+  strukturaFaktury,
   normalizujZamowienie,
   zbudujPlan,
   operationId,

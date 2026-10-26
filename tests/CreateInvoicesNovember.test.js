@@ -358,7 +358,7 @@ function srodowisko(spec, zmianyCfg = {}) {
       for (const o of [...w.orders.values(), ...w.dodatkoweKlucze.values()]) {
         const k = o.channelInfo.externalOrderId;
         if (!klucze.includes(k)) continue;
-        m.set(k, [...(m.get(k) || []), o._id]);
+        m.set(k, [...(m.get(k) || []), { id: o._id, status: o.status }]);
       }
       return m;
     },
@@ -733,7 +733,7 @@ test('9. zamówienie częściowo opłacone — ręczna decyzja', async () => {
 
 test('10. zamówienie anulowane — wykluczone, należność widoczna w sumach', async () => {
   const env = srodowisko([
-    { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1', cena: 160, wizyty: 4, status: 'CANCELED' }] }
+    { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1', cena: 160, wizyty: 4, status: 'CANCELED', statusCyklu: 'CANCELED' }] }
   ]);
 
   const p = await env.proces.podglad();
@@ -1005,7 +1005,7 @@ test('18. suma nowych faktur = rozliczenie zamówień źródłowych', async () =
     },
     { contactId: BEATA, nazwa: 'Beata Kowal', email: 'b@x.pl', umowy: [{ umowaId: 'u3', cena: 150, wizyty: 3 }] },
     { contactId: 'c-c', nazwa: 'Cezary Lis', email: 'c@x.pl', umowy: [{ umowaId: 'u4', paymentStatus: 'PAID', zaplacono: 640 }] },
-    { contactId: 'c-d', nazwa: 'Dorota Lis', email: 'd@x.pl', umowy: [{ umowaId: 'u5', status: 'CANCELED' }] },
+    { contactId: 'c-d', nazwa: 'Dorota Lis', email: 'd@x.pl', umowy: [{ umowaId: 'u5', status: 'CANCELED', statusCyklu: 'CANCELED' }] },
     { contactId: 'c-e', nazwa: 'Ewa Lis', email: 'e@x.pl', umowy: [{ umowaId: 'u6', fakturyWix: [{ id: 'i' }] }] }
   ]);
 
@@ -1448,4 +1448,122 @@ test('R4: cykl bez orderId i nieodczytane zamówienie bez kwoty — jawne braki'
   assert.equal([...env.inv.faktury.values()][0].totals.total, 640);
   const [op] = await env.db.find(DZIENNIK, { rodzaj: 'FAKTURA' });
   assert.deepEqual(op.audytFaktur.akceptowaneBraki, akc);
+});
+
+// ======================================================
+// REGUŁY Z ODCZYTU DANYCH WITRYNY (2026-10-26)
+// ======================================================
+
+const { kluczZgodny, strukturaFaktury } = _test;
+
+test('Dane: znane formaty externalOrderId są akceptowane, obce — nie', () => {
+  const m = '2026-11';
+  assert.equal(kluczZgodny('TOTO:2026-11:u1', m, 'u1'), true);
+  assert.equal(kluczZgodny('2026-11/u1', m, 'u1'), true);
+  assert.equal(kluczZgodny('TOTO:2026-11:u1:repair1', m, 'u1'), true);
+  assert.equal(kluczZgodny('TOTO:2026-11:u1/restore2', m, 'u1'), true);
+  assert.equal(kluczZgodny('', m, 'u1'), true);
+  assert.equal(kluczZgodny(undefined, m, 'u1'), true);
+  assert.equal(kluczZgodny('TOTO:2026-10:u1', m, 'u1'), false);
+  assert.equal(kluczZgodny('TOTO:2026-11:u2', m, 'u1'), false);
+  assert.equal(kluczZgodny('2026-11/u2', m, 'u1'), false);
+  assert.equal(kluczZgodny('TOTO:2026-11:u1:repairX', m, 'u1'), false);
+  assert.equal(kluczZgodny('TOTO:2026-11:u1x', m, 'u1'), false);
+});
+
+test('Dane: zamówienie bez externalOrderId i z formatem m/umowa — do faktury, gdy wizyty i kontakt się zgadzają', async () => {
+  const w = swiat([
+    { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1', externalOrderId: '2026-11/u1' }, { umowaId: 'u2', cena: 180 }] }
+  ]);
+  w.orders.get('ord-u2').channelInfo = { type: 'BACKOFFICE_MERCHANT' };
+  const env = srodowisko(w);
+  const p = await env.proces.podglad();
+  assert.equal(kat(p, 'ord-u1'), K.DO_FAKTURY);
+  assert.equal(kat(p, 'ord-u2'), K.DO_FAKTURY);
+  assert.equal(p.tabela.find(x => x.orderId === 'ord-u2').kluczZamowienia, '(brak)');
+  assert.equal(p.proponowaneFaktury[0].razem, '1360.00');
+});
+
+test('Dane: zamówienie bez klucza, ale z wizytami spoza cyklu — do sprawdzenia', async () => {
+  const w = swiat([
+    { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1' }] }
+  ]);
+  const o = w.orders.get('ord-u1');
+  o.channelInfo = {};
+  o.lineItems[0].catalogReference.catalogItemId = 'obca-wizyta';
+  const env = srodowisko(w);
+  assert.equal(kat(await env.proces.podglad(), 'ord-u1'), K.DO_SPRAWDZENIA);
+});
+
+test('Dane: naprawione zamówienie (repair) z anulowanym poprzednikiem — do faktury', async () => {
+  const w = swiat([
+    { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1', externalOrderId: 'TOTO:2026-11:u1:repair1' }] }
+  ]);
+  w.dodatkoweKlucze.set('stare', zamowienie({ id: 'ord-stare', numer: 1, contactId: ANNA, umowaId: 'u1', status: 'CANCELED' }));
+  const env = srodowisko(w);
+  const p = await env.proces.podglad();
+  assert.equal(kat(p, 'ord-u1'), K.DO_FAKTURY);
+
+  // Aktywne drugie zamówienie tej umowy (format m/umowa) nadal blokuje.
+  w.dodatkoweKlucze.set('aktywne', zamowienie({ id: 'ord-akt', numer: 2, contactId: ANNA, umowaId: 'u1', externalOrderId: '2026-11/u1' }));
+  const p2 = await env.proces.podglad();
+  assert.equal(kat(p2, 'ord-u1'), K.DO_SPRAWDZENIA);
+  assert.match(p2.doRecznejDecyzji[0].powod, /ord-akt/);
+});
+
+test('Dane: cykl DONE z anulowanym zamówieniem — do sprawdzenia, nie ciche wykluczenie', async () => {
+  const env = srodowisko([
+    { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1', status: 'CANCELED' }] }
+  ]);
+  const p = await env.proces.podglad();
+  assert.equal(kat(p, 'ord-u1'), K.DO_SPRAWDZENIA);
+  assert.match(p.doRecznejDecyzji[0].powod, /DONE/);
+  assert.equal(p.sumy.anulowane, '0.00');
+  assert.equal(p.sumy.doSprawdzenia, '640.00');
+});
+
+test('Dane: daty w opisie tylko, gdy odczytane ze wszystkich pozycji', async () => {
+  const w = swiat([
+    { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1' }, { umowaId: 'u2', cena: 180 }] }
+  ]);
+  w.orders.get('ord-u2').lineItems[0].descriptionLines = [{ plainText: { original: 'Nov 3, 2026, 3:00 PM / 50 min' } }];
+  const env = srodowisko(w);
+  const [plan] = (await env.proces.podglad()).proponowaneFaktury;
+  assert.match(plan.pozycje[0].opis, /\(03\.11, 10\.11, 17\.11, 24\.11\)/);
+  assert.doesNotMatch(plan.pozycje[1].opis, /\(/);
+});
+
+test('Dane: zamówienie PAID na 0 zł (stawka 0) — ZEROWE, nie do sprawdzenia', async () => {
+  const env = srodowisko([
+    { contactId: ANNA, nazwa: 'Anna Nowak', email: 'a@x.pl', umowy: [{ umowaId: 'u1', cena: 0, paymentStatus: 'PAID' }] }
+  ]);
+  assert.equal(kat(await env.proces.podglad(), 'ord-u1'), K.ZEROWE);
+});
+
+test('Dane: rabat merchantDiscount bez groszy ("160") rozłożony na pozycje', () => {
+  const raw = zamowienie({ id: 'o', numer: 1, contactId: 'c', umowaId: 'u', rabaty: [{ id: 'd', kwota: 160 }] });
+  raw.appliedDiscounts[0].merchantDiscount.amount = { amount: '160' };
+  raw.appliedDiscounts[0].lineItemDiscounts = raw.lineItems.map(l => ({ id: l._id, totalDiscount: { amount: '40.00' } }));
+  raw.lineItems.forEach(l => { l.totalDiscount = { amount: '40.00' }; });
+  const o = normalizujZamowienie(raw);
+  assert.deepEqual(o.problemy, []);
+  assert.equal(o.rabat, 16000);
+  assert.equal(o.razem, 48000);
+});
+
+test('PROBE: struktura faktury bez danych osobowych i bez zapisów', async () => {
+  const env = jedenKlient();
+  await przygotujIZatwierdz(env);
+  await wykonajWszystko(env);
+  const przed = env.db.zapisy;
+  const r = await env.proces.sonda();
+  assert.equal(r.status, 'OK');
+  assert.equal(r.zrodlo, 'dziennik 2026-11');
+  assert.deepEqual(r.brakujaceDlaKontroli, []);
+  assert.ok(r.customerKlucze.includes('email'));
+  assert.ok(!JSON.stringify(r).includes('a@x.pl'), 'brak danych osobowych');
+  assert.equal(env.db.zapisy, przed);
+
+  const s = strukturaFaktury({ id: { id: 'x', version: 2 }, lineItems: [{ name: 'A', price: 1, quantity: 1 }], totals: { total: 1 } });
+  assert.deepEqual(s.brakujaceDlaKontroli.sort(), ['currency', 'customer.contactId', 'metadata.sourceRefId', 'wasSent']);
 });
