@@ -633,7 +633,8 @@ function strukturaFaktury(f) {
     'id.version': typeof f?.id?.version === 'number',
     currency: typeof f?.currency === 'string',
     'customer.contactId': typeof f?.customer?.contactId === 'string',
-    'metadata.sourceRefId': f?.metadata?.sourceRefId !== undefined,
+    // Obecność klucza wystarcza: faktury październikowe go nie wypełniały.
+    'metadata.sourceRefId': Boolean(f?.metadata) && 'sourceRefId' in f.metadata,
     'totals.total': f?.totals?.total !== undefined,
     'lineItems[].name/price/quantity': linie.length > 0 &&
       linie.every(l => typeof l.name === 'string' && l.price !== undefined && l.quantity !== undefined),
@@ -1045,13 +1046,16 @@ function createGateway() {
   };
 
   // Mapa id → wynik albo null, gdy odczyt się nie powiódł (= „nieznane”).
-  async function wgZamowien(ids, fn, pole, wartosc) {
+  // pelna: odpowiedź musi zawierać każde zamówienie (transakcje).
+  // Order Invoices zwraca tylko zamówienia z fakturą (potwierdzone na
+  // witrynie 2026-10-26: 1 wpis na 100 zapytań) — brak wpisu = brak faktury.
+  async function wgZamowien(ids, fn, pole, wartosc, pelna) {
     try {
       const map = new Map();
       for (const part of kawalki(ids, 100)) {
         const r = await fn(part);
         for (const x of r[pole] || []) map.set(x.orderId, wartosc(x));
-        if (part.some(id => !map.has(id))) throw new Error('Niepełna odpowiedź.');
+        if (pelna && part.some(id => !map.has(id))) throw new Error('Niepełna odpowiedź.');
       }
       return map;
     } catch (e) {
@@ -1119,9 +1123,9 @@ function createGateway() {
       }
     },
 
-    fakturyZamowien: ids => wgZamowien(ids, listInvoices, 'invoicesForOrder', x => x.invoicesInfo || []),
+    fakturyZamowien: ids => wgZamowien(ids, listInvoices, 'invoicesForOrder', x => x.invoicesInfo || [], false),
 
-    transakcje: ids => wgZamowien(ids, listTransactions, 'orderTransactions', x => ({ payments: x.payments || [], refunds: x.refunds || [] })),
+    transakcje: ids => wgZamowien(ids, listTransactions, 'orderTransactions', x => ({ payments: x.payments || [], refunds: x.refunds || [] }), true),
 
     kontakt: id => contacts.getContact(id, { suppressAuth: true }),
 
