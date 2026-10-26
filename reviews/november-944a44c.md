@@ -129,3 +129,15 @@ Ujemna cena pozycji w Invoices V1 i rzeczywisty kształt `getInvoice` pozostają
 | — | Tryb `PROBE` (Velo, tylko odczyt): struktura `getInvoice` bez danych osobowych, `brakujaceDlaKontroli`. Odpowiada na niezweryfikowany kształt odpowiedzi V1; ujemna cena nadal wymaga osobnej decyzji. | `PROBE:` |
 
 `npm test`: 71/71. Ponowny przegląd: oczekuje.
+
+### Uproszczenie — commit 266a0e9
+
+Na prośbę właściciela skrypt uproszczono z 3634 do ok. 1550 linii. Zmiany istotne dla ponownego przeglądu:
+
+- Tryby: PROBE, PREVIEW, RUN, STATUS. PREPARE/APPROVE zastąpione bramką RUN: `oczekiwanaLiczba`/`oczekiwanaSuma` (wszystkie faktury miesiąca — stałe między kolejnymi RUN), `sprawdzilemPanelFaktur` + `kto` (R1, zapisywane w operacji jako `audyt`), `akceptujBraki` = dokładna lista braków z PREVIEW (R4). Statusy PREPARED → APPROVED → CREATING → CREATED → SENDING → SENT zachowane.
+- R1: zamiast audytu powiązanego z fingerprintem — potwierdzenie przy każdym RUN + kontrola fingerprintu operacji przed `createInvoice`; operacja niezgodna z zamówieniami, która nie dotarła do `createInvoice`, jest anulowana automatycznie (przypisania zwalniane).
+- RESOLVE usunięty: stany NEEDS_REVIEW rozstrzyga się edycją statusu wiersza w CMS (procedura w nagłówku). Ręcznie ustawiony CREATED przechodzi pełną kontrolę `sprawdzFakture` przed wysyłką; wyjątek „faktura bez sourceRefId” już nie istnieje (taką fakturę wysyła się ręcznie i ustawia SENT).
+- R2, R3: bez zmian merytorycznych. R4: braki jako jedna lista ID (`braki`), duplikaty liczone raz.
+- Przy przepisywaniu testy wykryły dwa błędy, oba poprawione: przejściowy błąd zapisu przypisania był traktowany jak konflikt; zamówienia przerwanej operacji PREPARED trafiały do nowego planu.
+
+`npm test`: 52/52. Ponowny przegląd: oczekuje.
