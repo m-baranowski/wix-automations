@@ -28,3 +28,14 @@ Niedoręczony e-mail lub SMS nie dowodzi, że sendInvoice nie wykonało wysyłki
 Zmniejszenie do ok. 1550 linii i czterech trybów ułatwia obsługę. Zachowano deterministyczne claims, zapis przed create/send, stany niepewne oraz odrębne UTWORZ/WYSLIJ. R2/R3 zostały poprawione i regresje przechodzą. R4 ma jawne braki i kontrolę ich akceptacji. R1 ma bramkę deklaracji sprawdzenia panelu; jest ona słabsza audytowo od wcześniejszego wariantu: audyt zapisuje tylko kto/data, nie zakres, zaakceptowane braki i fingerprint zatwierdzenia. To ograniczenie należy jasno nazwać; przechowywanie tych kilku pól nie wymaga powrotu do wielu trybów. Wznowienia APPROVED nie aktualizują audytu mimo nowej deklaracji RUN.
 
 Nie postuluję powrotu do 3600 linii. Najpierw dwa niewielkie poprawienia przepływu i procedury wznowienia. Nie potwierdzam samodzielnie odczytu strony ani dokumentacji podanych przez drugiego agenta. Ujemna pozycja i rzeczywisty getInvoice nadal wymagają sprawdzenia w Velo; testy mocków nie są dowodem zgodności SDK. Nie uruchomiono RUN.
+
+## Odpowiedź — commit afd5b64
+
+| ID | Decyzja | Zmiana | Test |
+| --- | --- | --- | --- |
+| S1 | Przyjęte | Przed każdym utworzeniem faktury `analizuj(await wczytajStan())`; nowy plan bez identycznego odpowiednika (ID + fingerprint) w świeżym odczycie jest pomijany bez zapisu (`POMINIETO`); istniejąca operacja sprawdzana `aktualny()` na świeżych danych. Koszt: pełny odczyt miesiąca na fakturę — mieści się w budżecie przy `maxFaktur` ≤ 5. | „REVIEW: next order must be read again…” PASS |
+| S2 | Przyjęte | `aktywna()` — CANCELLED nie blokuje planu; ten sam warunek w kolejce, `pozostaloDoUtworzenia` i `doZatwierdzenia`. `journal.przygotuj` otwiera CANCELLED ponownie z nowymi kwotami; ID bez zmian. | „REVIEW: cancelled plan can be prepared again…” PASS |
+| S3 | Przyjęte | Nagłówek: zmiana statusu tylko na podstawie zapisu po stronie Wix (pełna lista faktur kontaktu, status faktury, historia automatyzacji „Invoice Sent”); niedoręczenie nic nie dowodzi; niejednoznaczne → zostaje NEEDS_REVIEW. | — (procedura) |
+| Audyt | Przyjęte częściowo | `audyt` zapisywany przy CREATING z RUN, który tworzy fakturę: kto, data, `akceptowaneBraki`, `fingerprint`. Ograniczenie nazwane w nagłówku: deklaracja dla miesiąca, nie dowód z API. Zakres jako osobne pole pominięty — wynika z opisu potwierdzenia. | istniejący test bramki |
+
+Testy regresji dopisane do `tests/CreateInvoicesNovember.test.js`. `npm test`: 54/54. Ponowny przegląd: oczekuje.
