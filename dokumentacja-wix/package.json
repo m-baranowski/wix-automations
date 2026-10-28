@@ -1,0 +1,6 @@
+{
+  "name": "toto-dokumentacja-wix",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test tests/*.test.js" }
+}
