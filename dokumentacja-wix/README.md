@@ -41,7 +41,10 @@ razem z dokumentem. Nie jest to globalny dodatek do wszystkich Google Docs.
 
 ## Stan konfiguracji
 
-Wpisane: trzy foldery, oba szablony, konto nadawcy, szefowa zespołu, rzeczywiste ID obu usług,
+Szablon **Diagnoza / Informacja z przebiegu terapii** jest dostępny w panelu
+ręcznych zleceń. Nie uruchamia go rezerwacja w Wix.
+
+Wpisane: trzy foldery, trzy szablony, konto nadawcy, szefowa zespołu, rzeczywiste ID obu usług,
 pole daty urodzenia i pole imienia/nazwiska dziecka. Nie zapisano danych pacjentów.
 
 Do uzupełnienia przed wdrożeniem:

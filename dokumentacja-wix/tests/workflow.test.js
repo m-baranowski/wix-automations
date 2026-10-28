@@ -88,6 +88,7 @@ function environment() {
   settings.templates['ados-2'] = 'template';
   file('template', 'Szablon ADOS-2');
   settings.templates['si-opinia'] = 'template';
+  file(settings.templates['diagnoza-informacja-terapia'], 'Diagnoza / Informacja z przebiegu terapii');
   context.encrypt_ = () => blob;
   const request = {
     bookingId: 'booking-id-test', serviceId: '94fb8eaf-697a-470a-bb44-892e656b58f9',

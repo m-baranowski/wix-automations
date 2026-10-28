@@ -28,6 +28,23 @@ W konfiguracji na początku `google/owner/Code.gs` znajdują się:
 | Archiwum | [Otwórz folder](https://drive.google.com/drive/folders/1Ke_t2B1sELtD8SL-PZ_E8B7Lg3l19dTo) |
 | Szablon ADOS-2 | [Otwórz dokument](https://docs.google.com/document/d/1vvzoQ8rB0fEX7fxm32WM65s8VYXuy1f_HA8LicqEgt4/edit) |
 | Szablon SI | [Otwórz dokument](https://docs.google.com/document/d/1n24v4qDx7DF5mPh_4AMVxEY3lq_QT1D0F_uDoD05ypM/edit) |
+| Diagnoza / Informacja z przebiegu terapii — tylko ręcznie | [Otwórz dokument](https://docs.google.com/document/d/18MXHSKmE5_I4RGFqitDBJmyHSRz6cgxydCv4aUiKxU4/edit) |
+
+Szablon `diagnoza-informacja-terapia` jest dostępny wyłącznie w panelu ręcznych
+zleceń. Nie ma przypisanej usługi w `SETTINGS.services` ani w automatyzacji Wix.
+Lista panelu i nazwa tworzonego pliku korzystają z rzeczywistej nazwy dokumentu
+Google Docs; ustaw ją na **Diagnoza / Informacja z przebiegu terapii**.
+
+Aby dodać go do działającego projektu, dopisz w `SETTINGS.templates`:
+
+```javascript
+'diagnoza-informacja-terapia': '18MXHSKmE5_I4RGFqitDBJmyHSRz6cgxydCv4aUiKxU4'
+```
+
+Oddziel wpisy przecinkami. Zachowaj pozostałe ustawienia działającego projektu.
+Zapisz kod, uruchom **validateSetup**, a następnie zaktualizuj oba aktywne wdrożenia
+do nowej wersji zgodnie z punktem 3. Dodaj menu do nowego szablonu według punktu 4
+i odśwież panel ręcznych zleceń.
 
 Na Dysku kontakt utwórz dodatkowy folder **Toto – dokumentacja – techniczne**:
 
@@ -165,7 +182,7 @@ z okna wdrożenia, bez ręcznej zmiany ścieżki.
 | Gdzie użyć adresu | Które wdrożenie |
 |---|---|
 | Wix Secrets Manager → `TOTO_DOCS_WEBAPP_URL` | **Brama Wix i menu** |
-| `Menu.gs` w obu szablonach → `TOTO_WEBAPP_URL` | **Brama Wix i menu** |
+| `Menu.gs` w każdym szablonie → `TOTO_WEBAPP_URL` | **Brama Wix i menu** |
 | Zakładka w przeglądarce do obsługi ręcznych zleceń | **Panel zleceń Toto** |
 
 Brama weryfikuje podpis HMAC żądań Wix oraz indywidualny klucz zatwierdzenia
@@ -193,14 +210,15 @@ korzystają z zapisanego kodu projektu.
 
 Nie archiwizuj wdrożenia, którego adres jest używany przez Wix, menu albo zakładkę panelu.
 Jeśli zastępujesz archiwalną bramę nową, jej nowy URL wpisz do sekretu Wix oraz
-`TOTO_WEBAPP_URL` w obu szablonach. Zapisz skrypty szablonów. Dokumenty robocze,
+`TOTO_WEBAPP_URL` w każdym szablonie. Zapisz skrypty szablonów. Dokumenty robocze,
 które powstały wcześniej, mają własne kopie skryptu menu: w nich również popraw URL
 albo zatwierdzaj je przez aktywny panel. Zmiana skryptu szablonu nie aktualizuje
 skryptów w istniejących dokumentach.
 
 ## 4. Menu w szablonach Google Docs
 
-Wykonaj poniższe czynności osobno dla szablonu ADOS-2 i szablonu SI:
+Wykonaj poniższe czynności osobno dla każdego szablonu: ADOS-2, SI oraz
+„Diagnoza / Informacja z przebiegu terapii”:
 
 1. Otwórz szablon jako właściciel lub edytor.
 2. Wybierz **Rozszerzenia → Apps Script**. Jest to projekt powiązany z tym dokumentem.

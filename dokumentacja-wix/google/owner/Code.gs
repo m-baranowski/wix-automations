@@ -20,7 +20,9 @@ const SETTINGS = {
   },
   templates: {
     'si-opinia': '1n24v4qDx7DF5mPh_4AMVxEY3lq_QT1D0F_uDoD05ypM',
-    'ados-2': '1vvzoQ8rB0fEX7fxm32WM65s8VYXuy1f_HA8LicqEgt4'
+    'ados-2': '1vvzoQ8rB0fEX7fxm32WM65s8VYXuy1f_HA8LicqEgt4',
+    // Diagnoza / Informacja z przebiegu terapii — tylko zlecenia ręczne.
+    'diagnoza-informacja-terapia': '18MXHSKmE5_I4RGFqitDBJmyHSRz6cgxydCv4aUiKxU4'
   },
   // Zgodność usługa -> szablon weryfikowana również po stronie Google.
   services: {
